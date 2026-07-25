@@ -4,9 +4,9 @@ Give an **AirPlay 2 receiver** to any speaker that only speaks UPnP/DLNA.
 
 Plenty of networked speakers, soundbars and AV receivers expose a UPnP
 MediaRenderer but have no AirPlay support, so they are invisible to macOS and
-iOS. This runs on a Raspberry Pi, terminates the AirPlay session, and relays the
-audio to the renderer as an uncompressed stream. The speaker then appears in the
-AirPlay menu like any AirPlay device.
+iOS. This runs on a Raspberry Pi, any Linux box or a Mac: it terminates the
+AirPlay session and relays the audio to the renderer as an uncompressed stream,
+so the speaker appears in the AirPlay menu like any AirPlay device.
 
 It also serves a **web control panel**, so any phone or laptop on the network can
 see what is playing and control volume, mute and playback.
@@ -20,21 +20,25 @@ see what is playing and control volume, mute and playback.
 </p>
 
 ```
-  AirPlay source (Mac, iPhone, …)
-        │  AirPlay 2
-        ▼
-  Raspberry Pi ── shairport-sync ──▶ raw PCM
-        │                              │
-        │                    bridge.py fans it out
-        │                              ▼
-        │                 endless WAV over HTTP  ──┐
-        │                                          │
-        └──── UPnP AVTransport: "play that URL" ───┤
-                                                   ▼
-                                        UPnP/DLNA renderer
+   AirPlay source (Mac, iPhone, iPad …)
+                │
+                │  AirPlay 2
+                ▼
+   ┌──────────────────────────────────────────────┐
+   │  Bridge host — Raspberry Pi, Linux or macOS  │
+   │                                              │
+   │    shairport-sync ──▶ PCM ──▶ bridge.py      │
+   └──────────────────────────────────────────────┘
+                │                          │
+    UPnP "play  │                          │  endless WAV
+    that URL"   │                          │  over HTTP
+                ▼                          ▼
+   ┌──────────────────────────────────────────────┐
+   │            UPnP / DLNA renderer              │
+   └──────────────────────────────────────────────┘
 ```
 
-The Pi does all the work, so nothing needs to run on the sending device and any
+The host does all the work, so nothing needs to run on the sending device and any
 AirPlay source on the network can use it.
 
 ## Does my speaker work?
@@ -56,7 +60,7 @@ are welcome.
 
 ## Requirements
 
-- A always-on host on the same network as the speaker — a Raspberry Pi, any
+- An always-on host on the same network as the speaker — a Raspberry Pi, any
   Linux box, or a Mac
 - Python 3.11+ — standard library only, no pip packages
 - A UPnP/DLNA renderer, powered on and on its network input
@@ -193,7 +197,7 @@ curl -s -X POST http://<host>:8772/transport/playpause
 ```
 
 `version` is the release (`APP_VERSION` in `config.py`); `revision` is the git
-commit the Pi was deployed from, so drift between your checkout and the Pi is
+commit the host was deployed from, so drift between your checkout and the host is
 visible without comparing checksums. A `-dirty` suffix means uncommitted code is
 running there.
 
@@ -288,7 +292,7 @@ lip-sync. The renderer's buffer is its own and cannot be tuned from this side.
 ./run-tests.sh test_bridge     # one module, verbose
 ```
 
-Standard-library `unittest` only, so it runs unchanged on the Pi. Nothing needs
+Standard-library `unittest` only, so it runs unchanged on the host. Nothing needs
 real hardware or a browser: UPnP runs against a fake renderer, the metadata
 reader against a temporary FIFO, and DACP against captured `avahi-browse` output.
 
@@ -319,7 +323,7 @@ the system reported healthy while sounding wrong:
 | `bridge/api.py` | host | HTTP status API and routing |
 | `bridge/webui.py` | host | The web control panel |
 | `bridge/install.sh` | host | Installs deps, config and the service (systemd/launchd) |
-| `deploy.sh` | workstation | Copies to the Pi and runs the installer |
+| `deploy.sh` | workstation | Copies to a remote host and runs the installer |
 | `tools/diagnose.py` | either | End-to-end health check — run this first |
 | `tools/level.py` | either | Measures the live stream in dBFS |
 
@@ -367,7 +371,7 @@ sudo systemctl restart airplay-soundbar
 is a wedged media engine: **unplug it at the wall for 30 seconds.** The remote's
 power button is not enough, because network standby preserves the stuck state.
 
-**Not in the AirPlay menu.** Check the Pi is advertising and `nqptp` is running —
+**Not in the AirPlay menu.** Check the host is advertising and `nqptp` is running —
 AirPlay 2 will not work without it:
 
 ```bash
@@ -422,7 +426,7 @@ for any noncommercial purpose.
 ### Third-party components
 
 This bridge drives, but does not include or modify, two GPL programs by Mike
-Brady — they are installed from source on the Pi and run as separate processes:
+Brady — they are installed on the host and run as separate processes:
 
 - [shairport-sync](https://github.com/mikebrady/shairport-sync) — the AirPlay receiver
 - [nqptp](https://github.com/mikebrady/nqptp) — PTP timing for AirPlay 2
