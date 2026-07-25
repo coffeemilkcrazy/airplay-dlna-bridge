@@ -11,6 +11,14 @@ AirPlay menu like any AirPlay device.
 It also serves a **web control panel**, so any phone or laptop on the network can
 see what is playing and control volume, mute and playback.
 
+<p align="center">
+  <img src="docs/web-panel.png" alt="The web control panel: now playing with
+  cover art, transport buttons, a capped volume slider, and live bridge status"
+  width="420">
+  <br>
+  <sub>Placeholder data — the page itself is served by the bridge.</sub>
+</p>
+
 ```
   AirPlay source (Mac, iPhone, …)
         │  AirPlay 2
@@ -111,7 +119,7 @@ Open **`http://<host>:8772/`** from any device on the network.
 - Live state: AirPlay session, attached renderers, audio sent, version
 - Refreshes every 2s, and says plainly when the bridge or speaker is unreachable
 
-Self-contained: no CDN, no build step, no internet access needed on the Pi. It
+Self-contained: no CDN, no build step, no internet access needed on the host. It
 follows light/dark mode, is laid out phone-first, and stops polling while the tab
 is hidden so leaving it open costs nothing.
 
