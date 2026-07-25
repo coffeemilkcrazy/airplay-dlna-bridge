@@ -12,8 +12,11 @@ hands us the two pieces needed:
     acre  Active-Remote    per-session token, sent as a header
 
 The service itself is advertised over mDNS as `iTunes_Ctrl_<DACP-ID>` under
-`_dacp._tcp`. We resolve it with avahi-browse rather than adding a Python
-mDNS dependency - avahi-daemon is already required for AirPlay to work at all.
+`_dacp._tcp`. We resolve it with whichever mDNS tool the host provides rather
+than adding a Python mDNS dependency, since one is always present already:
+
+    Linux   avahi-browse   (avahi-daemon is required for AirPlay anyway)
+    macOS   dns-sd         (part of Bonjour, always installed)
 
     GET http://<host>:<port>/ctrl-int/1/playpause
     Active-Remote: <token>
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -44,6 +48,8 @@ COMMANDS = {
 
 RESOLVE_TTL = 60.0          # re-resolve at most this often
 RESOLVE_TIMEOUT = 6.0
+# dns-sd streams until killed; this is how long we let it look.
+DNSSD_TIMEOUT = 3.0
 
 
 class DacpRemote:
@@ -113,21 +119,28 @@ class DacpRemote:
 
 
 def resolve_dacp(dacp_id: str) -> tuple[str, int] | None:
-    """Find iTunes_Ctrl_<dacp_id>._dacp._tcp via avahi-browse.
-
-    Output lines look like:
-      =;eth0;IPv4;iTunes_Ctrl_ABC123;_dacp._tcp;local;host.local;192.168.1.5;3689;
-    """
+    """Find iTunes_Ctrl_<dacp_id>._dacp._tcp using the host's mDNS tool."""
     target = f"iTunes_Ctrl_{dacp_id}"
-    try:
-        proc = subprocess.run(
-            ["avahi-browse", "-rptk", "_dacp._tcp"],
-            capture_output=True, text=True, timeout=RESOLVE_TIMEOUT)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log.warning("avahi-browse unavailable (%s); transport control needs it", e)
+    if shutil.which("avahi-browse"):
+        found = _resolve_avahi(target)
+    elif shutil.which("dns-sd"):
+        found = _resolve_dnssd(target)
+    else:
+        log.warning("no mDNS tool found (avahi-browse or dns-sd); "
+                    "transport control needs one")
         return None
 
-    for line in proc.stdout.splitlines():
+    if not found:
+        log.info("no DACP service advertised for %s", target)
+    return found
+
+
+def parse_avahi(output: str, target: str) -> tuple[str, int] | None:
+    """Resolved avahi-browse lines look like:
+
+    =;eth0;IPv4;iTunes_Ctrl_ABC;_dacp._tcp;local;host.local;192.0.2.10;3689;
+    """
+    for line in output.splitlines():
         if not line.startswith("=") or target not in line:
             continue
         parts = line.split(";")
@@ -141,6 +154,50 @@ def resolve_dacp(dacp_id: str) -> tuple[str, int] | None:
             return host, int(port)
         except ValueError:
             continue
-
-    log.info("no DACP service advertised for %s", target)
     return None
+
+
+def parse_dnssd(output: str) -> tuple[str, int] | None:
+    """dns-sd -L prints, among banner lines:
+
+    13:50:25.464  iTunes_Ctrl_ABC._dacp._tcp.local. can be reached at mac.local.:3689 (interface 15)
+
+    The hostname is left as-is: macOS resolves .local names itself.
+    """
+    m = re.search(r"can be reached at\s+(\S+?)\.?:(\d+)", output)
+    if not m:
+        return None
+    try:
+        return m.group(1), int(m.group(2))
+    except ValueError:
+        return None
+
+
+def _resolve_avahi(target: str) -> tuple[str, int] | None:
+    try:
+        proc = subprocess.run(["avahi-browse", "-rptk", "_dacp._tcp"],
+                              capture_output=True, text=True,
+                              timeout=RESOLVE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("avahi-browse failed: %s", e)
+        return None
+    return parse_avahi(proc.stdout, target)
+
+
+def _resolve_dnssd(target: str) -> tuple[str, int] | None:
+    """macOS. dns-sd never exits on its own, so it is killed after a moment
+    and whatever it printed by then is parsed."""
+    try:
+        proc = subprocess.run(["dns-sd", "-L", target, "_dacp._tcp", "local"],
+                              capture_output=True, text=True,
+                              timeout=DNSSD_TIMEOUT)
+        output = proc.stdout
+    except subprocess.TimeoutExpired as e:
+        # Expected: the timeout is how we stop it. Partial output is the point.
+        output = e.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors="ignore")
+    except OSError as e:
+        log.warning("dns-sd failed: %s", e)
+        return None
+    return parse_dnssd(output)

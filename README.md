@@ -48,39 +48,63 @@ are welcome.
 
 ## Requirements
 
-- A Raspberry Pi, or any Debian-ish Linux box, on the same network as the speaker
+- A always-on host on the same network as the speaker — a Raspberry Pi, any
+  Linux box, or a Mac
 - Python 3.11+ — standard library only, no pip packages
-- SSH access to the Pi, with sudo
 - A UPnP/DLNA renderer, powered on and on its network input
+
+| Host | Package source | Service | AirPlay |
+|---|---|---|---|
+| Debian / Ubuntu / Raspberry Pi OS | source build | systemd | **2** |
+| Fedora / Arch | distro package | systemd | 1 |
+| macOS | Homebrew | launchd | 1 |
+
+AirPlay 2 needs `nqptp` and a shairport-sync built `--with-airplay-2`, which
+only the Debian path does. Elsewhere you get AirPlay 1 — fine for most senders,
+though recent macOS releases can be fussy about AirPlay 1 receivers.
 
 ## Install
 
-From your workstation, with the Pi reachable over SSH:
+**On the host itself:**
 
 ```bash
 git clone https://github.com/<you>/airplay-dlna-bridge.git
 cd airplay-dlna-bridge
-./deploy.sh pi@raspberrypi.local              # renderer auto-discovered
-./deploy.sh pi@raspberrypi.local 192.0.2.10   # or name it explicitly
+
+sudo ./bridge/install.sh                 # Linux
+./bridge/install.sh                      # macOS — no sudo, Homebrew refuses it
+sudo ./bridge/install.sh 192.0.2.10      # name the renderer explicitly
 ```
 
-You will be prompted for the Pi's sudo password. Nothing is stored.
+**Or push it to a remote host over SSH** (prompts once for its sudo password;
+nothing is stored):
 
-**The first run builds shairport-sync from source with AirPlay 2** and takes a
-few minutes. Debian's package is AirPlay 1 only — no `libplist`/`libsodium`, and
-`nqptp` is not packaged — and recent macOS releases have trouble connecting to
-AirPlay 1 receivers. The build also installs `nqptp`, the PTP timing daemon
-AirPlay 2 requires, as its own service.
+```bash
+./deploy.sh pi@raspberrypi.local
+./deploy.sh user@host.local 192.0.2.10
+```
 
-Re-running skips the build. `REBUILD=1` forces it; `AIRPLAY2=0` uses the Debian
-AirPlay 1 package instead.
+On Debian **the first run builds shairport-sync from source** and takes a few
+minutes, because the packaged build is AirPlay 1 only — no
+`libplist`/`libsodium`, and `nqptp` is not packaged. It installs `nqptp` too, as
+its own service. Re-running skips the build; `REBUILD=1` forces it and
+`AIRPLAY2=0` uses the distro package instead.
 
 Then turn the speaker on, set it to its network input, and pick it from the
 AirPlay menu.
 
+### Where things go
+
+| | Linux | macOS |
+|---|---|---|
+| Code | `/opt/airplay-soundbar` | `~/Library/Application Support/airplay-dlna-bridge` |
+| Config | `/etc/airplay-soundbar` | `~/.config/airplay-dlna-bridge` |
+| Service | `systemd` unit | `~/Library/LaunchAgents` |
+| Logs | `journalctl -u airplay-soundbar -f` | `tail -f /tmp/airplay-dlna-bridge.log` |
+
 ## Web control panel
 
-Open **`http://<pi-host>:8772/`** from any device on the network.
+Open **`http://<host>:8772/`** from any device on the network.
 
 - Now playing — title, artist, album, cover art, elapsed time
 - **Play / pause / skip**, plus a volume slider and mute
@@ -154,10 +178,10 @@ practice the difference is small unless you habitually run that slider low.
 ## Status API
 
 ```bash
-curl -s http://<pi-host>:8772/status | python3 -m json.tool
-curl -s -X POST http://<pi-host>:8772/volume/10
-curl -s -X POST http://<pi-host>:8772/mute/on
-curl -s -X POST http://<pi-host>:8772/transport/playpause
+curl -s http://<host>:8772/status | python3 -m json.tool
+curl -s -X POST http://<host>:8772/volume/10
+curl -s -X POST http://<host>:8772/mute/on
+curl -s -X POST http://<host>:8772/transport/playpause
 ```
 
 `version` is the release (`APP_VERSION` in `config.py`); `revision` is the git
@@ -278,15 +302,15 @@ the system reported healthy while sounding wrong:
 
 | Path | Runs on | What it is |
 |---|---|---|
-| `bridge/bridge.py` | Pi | The service — orchestration only |
-| `bridge/config.py` | Pi | Every setting, declared once |
+| `bridge/bridge.py` | host | The service — orchestration only |
+| `bridge/config.py` | host | Every setting, declared once |
 | `bridge/soundbar.py` | both | UPnP AVTransport/RenderingControl + Samsung WAM |
-| `bridge/streamer.py` | Pi | PCM fan-out and the endless-WAV HTTP server |
-| `bridge/metadata.py` | Pi | shairport metadata: track info, cover art, DACP creds |
-| `bridge/dacp.py` | Pi | Play/pause/skip, sent back to the AirPlay sender |
-| `bridge/api.py` | Pi | HTTP status API and routing |
-| `bridge/webui.py` | Pi | The web control panel |
-| `bridge/install-pi.sh` | Pi | Installs deps, config and the systemd unit |
+| `bridge/streamer.py` | host | PCM fan-out and the endless-WAV HTTP server |
+| `bridge/metadata.py` | host | shairport metadata: track info, cover art, DACP creds |
+| `bridge/dacp.py` | host | Play/pause/skip, sent back to the AirPlay sender |
+| `bridge/api.py` | host | HTTP status API and routing |
+| `bridge/webui.py` | host | The web control panel |
+| `bridge/install.sh` | host | Installs deps, config and the service (systemd/launchd) |
 | `deploy.sh` | workstation | Copies to the Pi and runs the installer |
 | `tools/diagnose.py` | either | End-to-end health check — run this first |
 | `tools/level.py` | either | Measures the live stream in dBFS |
@@ -341,7 +365,7 @@ AirPlay 2 will not work without it:
 ```bash
 dns-sd -B _airplay._tcp          # macOS
 avahi-browse -rt _airplay._tcp   # Linux
-ssh pi@raspberrypi.local 'systemctl is-active nqptp; shairport-sync -V'
+systemctl is-active nqptp; shairport-sync -V
 ```
 
 The version string must contain `AirPlay2`. If not, `REBUILD=1 ./deploy.sh`.
@@ -349,9 +373,14 @@ The version string must contain `AirPlay2`. If not, `REBUILD=1 ./deploy.sh`.
 **Logs.**
 
 ```bash
-ssh pi@raspberrypi.local 'journalctl -u airplay-soundbar -f'
-curl -s http://<pi-host>:8772/status | python3 -m json.tool
+journalctl -u airplay-soundbar -f       # Linux
+tail -f /tmp/airplay-dlna-bridge.log    # macOS
+curl -s http://<host>:8772/status | python3 -m json.tool
 ```
+
+Transport control shells out to the host's mDNS tool — `avahi-browse` on Linux,
+`dns-sd` on macOS. If neither is present the log says so and the buttons stay
+disabled.
 
 ## Contributing
 

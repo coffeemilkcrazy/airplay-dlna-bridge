@@ -1,20 +1,43 @@
 #!/usr/bin/env bash
 #
-# Install the AirPlay -> Samsung soundbar bridge on a Raspberry Pi.
-# Run ON the Pi, as a user with sudo:
+# Install the AirPlay -> UPnP/DLNA bridge on this machine.
 #
-#     sudo ./install-pi.sh [SOUNDBAR_IP] [AIRPLAY_NAME]
+#     sudo ./install.sh [RENDERER_IP] [AIRPLAY_NAME]
 #
-# Builds shairport-sync from source with AirPlay 2 support (the Debian package
-# is AirPlay 1 only), installs nqptp for PTP timing, then installs the bridge
-# as a systemd service.
+# Supports Debian/Ubuntu (incl. Raspberry Pi OS), Fedora, Arch and macOS.
+# Runs locally; deploy.sh is a convenience wrapper that copies here first.
 #
-# Idempotent: re-running skips builds that are already in place. Force a
-# rebuild with  REBUILD=1 sudo ./install-pi.sh
+# Debian gets AirPlay 2 by building shairport-sync from source (the packaged
+# build is AirPlay 1 only) plus nqptp for PTP timing, and a systemd unit.
+# Other Linux uses packaged shairport-sync. macOS uses Homebrew and launchd -
+# note Homebrew's build is AirPlay 1 only and nqptp is not packaged there, so
+# macOS hosts are AirPlay 1.
 #
-# Set AIRPLAY2=0 to use the (much faster) Debian AirPlay 1 package instead.
+# Idempotent: re-running skips work already done. REBUILD=1 forces a rebuild;
+# AIRPLAY2=0 skips the source build on Debian.
 
 set -euo pipefail
+
+# --------------------------------------------------------------------------- #
+# Host detection
+# --------------------------------------------------------------------------- #
+OS="$(uname -s)"
+case "$OS" in
+    Darwin) PLATFORM=macos ;;
+    Linux)  PLATFORM=linux ;;
+    *) echo "Unsupported OS: $OS" >&2; exit 1 ;;
+esac
+
+PKG=""
+if [[ "$PLATFORM" == "macos" ]]; then
+    PKG=brew
+elif command -v apt-get >/dev/null; then
+    PKG=apt
+elif command -v dnf >/dev/null; then
+    PKG=dnf
+elif command -v pacman >/dev/null; then
+    PKG=pacman
+fi
 
 SOUNDBAR_IP="${1:-${SOUNDBAR_IP:-}}"
 AIRPLAY_NAME="${2:-${AIRPLAY_NAME:-Soundbar}}"
@@ -22,14 +45,34 @@ AIRPLAY2="${AIRPLAY2:-1}"
 REBUILD="${REBUILD:-0}"
 JOBS="$(nproc)"
 
-APP_DIR=/opt/airplay-soundbar
-CONF_DIR=/etc/airplay-soundbar
+if [[ "$PLATFORM" == "macos" ]]; then
+    # Unprivileged install: Homebrew will not run as root, so everything lives
+    # under the user's home and the service is a LaunchAgent.
+    APP_DIR="$HOME/Library/Application Support/airplay-dlna-bridge"
+    CONF_DIR="$HOME/.config/airplay-dlna-bridge"
+    PLIST="$HOME/Library/LaunchAgents/com.airplay-dlna-bridge.plist"
+else
+    APP_DIR=/opt/airplay-soundbar
+    CONF_DIR=/etc/airplay-soundbar
+fi
 BUILD_DIR=/usr/local/src
 METADATA_PIPE=/tmp/shairport-sync-metadata
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ $EUID -ne 0 ]]; then
+# Homebrew refuses to run as root, so on macOS we stay unprivileged and use a
+# per-user LaunchAgent instead of a system daemon.
+if [[ "$PLATFORM" == "linux" && $EUID -ne 0 ]]; then
     echo "Please run with sudo:  sudo $0 $*" >&2
+    exit 1
+fi
+if [[ "$PLATFORM" == "macos" && $EUID -eq 0 ]]; then
+    echo "On macOS run WITHOUT sudo - Homebrew refuses to run as root." >&2
+    exit 1
+fi
+
+if [[ -z "$PKG" ]]; then
+    echo "No supported package manager found (apt/dnf/pacman/brew)." >&2
+    echo "Install shairport-sync and avahi yourself, then re-run." >&2
     exit 1
 fi
 
@@ -44,13 +87,17 @@ export DEBIAN_FRONTEND=noninteractive
 # than merely disable it, since apt re-enables units on upgrade.
 # --------------------------------------------------------------------------- #
 say "Clearing any existing shairport-sync service"
-systemctl disable --now shairport-sync.service 2>/dev/null || true
-systemctl mask shairport-sync.service 2>/dev/null || true
+if [[ "$PLATFORM" == "linux" ]]; then
+    systemctl disable --now shairport-sync.service 2>/dev/null || true
+    systemctl mask shairport-sync.service 2>/dev/null || true
+else
+    brew services stop shairport-sync 2>/dev/null || true
+fi
 pkill -x shairport-sync 2>/dev/null || true
 sleep 1
 
 # --------------------------------------------------------------------------- #
-if [[ "$AIRPLAY2" == "1" ]]; then
+if [[ "$PLATFORM" == "linux" && "$PKG" == "apt" && "$AIRPLAY2" == "1" ]]; then
 
     have_airplay2() {
         command -v shairport-sync >/dev/null 2>&1 && \
@@ -143,10 +190,26 @@ if [[ "$AIRPLAY2" == "1" ]]; then
         say "Built: $(shairport-sync -V | head -1)"
     fi
 
+elif [[ "$PLATFORM" == "macos" ]]; then
+    say "Installing shairport-sync via Homebrew (AirPlay 1)"
+    # Homebrew's formula is built without --with-airplay-2 and nqptp is not
+    # packaged, so a macOS host is AirPlay 1 only. Fine for most senders, but
+    # recent macOS releases can be fussy about AirPlay 1 receivers.
+    brew list shairport-sync >/dev/null 2>&1 || brew install shairport-sync
+    brew services stop shairport-sync 2>/dev/null || true
+
 else
-    say "Installing shairport-sync from Debian (AirPlay 1)"
-    apt-get update -qq
-    apt-get install -y --no-install-recommends shairport-sync avahi-daemon python3
+    say "Installing packaged shairport-sync (AirPlay 1)"
+    case "$PKG" in
+        apt)
+            apt-get update -qq
+            apt-get install -y --no-install-recommends \
+                shairport-sync avahi-daemon python3 ;;
+        dnf)
+            dnf install -y shairport-sync avahi python3 ;;
+        pacman)
+            pacman -Sy --noconfirm shairport-sync avahi python ;;
+    esac
     systemctl disable --now shairport-sync.service 2>/dev/null || true
     systemctl mask shairport-sync.service 2>/dev/null || true
 fi
@@ -239,7 +302,7 @@ else
 fi
 
 cat > "$CONF_DIR/shairport.conf" <<CONF
-// Managed by install-pi.sh - edits are overwritten on reinstall.
+// Managed by install.sh - edits are overwritten on reinstall.
 general = {
     name = "${AIRPLAY_NAME}";
     output_backend = "stdout";
@@ -287,7 +350,7 @@ CONF
 # in exactly one place rather than here as well.
 {
     echo "# Environment for airplay-soundbar.service"
-    echo "# Generated by install-pi.sh - edits are overwritten on reinstall."
+    echo "# Generated by install.sh - edits are overwritten on reinstall."
     while read -r var; do
         [[ -z "$var" ]] && continue
         printf '%s=%s\n' "$var" "${!var-}"
@@ -297,26 +360,73 @@ CONF
 chmod 644 "$CONF_DIR/shairport.conf" "$CONF_DIR/bridge.env"
 
 # --------------------------------------------------------------------------- #
-say "Installing systemd service"
-install -m 644 "$SRC_DIR/systemd/airplay-soundbar.service" \
-    /etc/systemd/system/airplay-soundbar.service
-systemctl daemon-reload
-systemctl enable airplay-soundbar.service
-systemctl restart airplay-soundbar.service
+if [[ "$PLATFORM" == "linux" ]]; then
+    say "Installing systemd service"
+    install -m 644 "$SRC_DIR/systemd/airplay-soundbar.service" \
+        /etc/systemd/system/airplay-soundbar.service
+    systemctl daemon-reload
+    systemctl enable airplay-soundbar.service
+    systemctl restart airplay-soundbar.service
+else
+    say "Installing LaunchAgent"
+    mkdir -p "$(dirname "$PLIST")"
+    # A LaunchAgent (not a Daemon) so it runs as the logged-in user, which is
+    # what Homebrew's shairport-sync expects and what avahi/Bonjour needs.
+    cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.airplay-dlna-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>${APP_DIR}/bridge.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+$(while read -r var; do
+      [[ -z "$var" ]] && continue
+      printf '    <key>%s</key><string>%s</string>\n' "$var" "${!var-}"
+  done < <(python3 "$SRC_DIR/config.py" --env-names))
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/airplay-dlna-bridge.log</string>
+  <key>StandardErrorPath</key><string>/tmp/airplay-dlna-bridge.log</string>
+</dict>
+</plist>
+PLISTEOF
+    launchctl unload "$PLIST" 2>/dev/null || true
+    launchctl load "$PLIST"
+fi
 
 sleep 4
-say "Service status"
-systemctl --no-pager --lines=20 status airplay-soundbar.service || true
+if [[ "$PLATFORM" == "linux" ]]; then
+    say "Service status"
+    systemctl --no-pager --lines=20 status airplay-soundbar.service || true
+fi
 
 # --------------------------------------------------------------------------- #
 say "Smoke check"
 SMOKE_FAIL=0
 
-if systemctl is-active --quiet airplay-soundbar; then
-    note "service active"
+if [[ "$PLATFORM" == "linux" ]]; then
+    if systemctl is-active --quiet airplay-soundbar; then
+        note "service active"
+    else
+        echo "  FAIL: service is not active" >&2
+        SMOKE_FAIL=1
+    fi
 else
-    echo "  FAIL: service is not active" >&2
-    SMOKE_FAIL=1
+    if launchctl list | grep -q com.airplay-dlna-bridge; then
+        note "LaunchAgent loaded"
+    else
+        echo "  FAIL: LaunchAgent is not loaded" >&2
+        SMOKE_FAIL=1
+    fi
 fi
 
 # Give the status API a moment, then confirm it actually answers.
@@ -356,22 +466,34 @@ fi
 if [[ "$SMOKE_FAIL" == "1" ]]; then
     echo >&2
     echo "  Install completed but the smoke check failed. Inspect:" >&2
-    echo "    journalctl -u airplay-soundbar -n 50 --no-pager" >&2
+    if [[ "$PLATFORM" == "linux" ]]; then
+        echo "    journalctl -u airplay-soundbar -n 50 --no-pager" >&2
+    else
+        echo "    tail -50 /tmp/airplay-dlna-bridge.log" >&2
+    fi
 fi
 
-PI_IP="$(hostname -I | awk '{print $1}')"
+if [[ "$PLATFORM" == "linux" ]]; then
+    HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    LOGCMD="journalctl -u airplay-soundbar -f"
+    RESTART="systemctl restart airplay-soundbar"
+else
+    HOST_IP="$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1)"
+    LOGCMD="tail -f /tmp/airplay-dlna-bridge.log"
+    RESTART="launchctl kickstart -k gui/\$UID/com.airplay-dlna-bridge"
+fi
+
 cat <<DONE
 
 Installed.
 
   AirPlay name : ${AIRPLAY_NAME}
-  AirPlay ver  : $( [[ "$AIRPLAY2" == "1" ]] && echo "2 (port 7000)" || echo "1 (port 5000)" )
-  Soundbar     : ${SOUNDBAR_IP:-auto-discover}
-  Status API   : http://${PI_IP}:8772/status
+  AirPlay ver  : $( [[ "$PLATFORM" == "linux" && "$PKG" == "apt" && "$AIRPLAY2" == "1" ]] && echo "2 (port 7000)" || echo "1 (port 5000)" )
+  Renderer     : ${SOUNDBAR_IP:-auto-discover}
+  Web panel    : http://${HOST_IP}:${STATUS_PORT:-8772}/
 
-  journalctl -u airplay-soundbar -f      # follow the log
-  systemctl restart airplay-soundbar     # restart after changes
+  ${LOGCMD}
+  ${RESTART}
 
-On your Mac, "${AIRPLAY_NAME}" should now appear in the AirPlay menu
-(Control Centre > Sound, or the AirPlay button in Music.app).
+"${AIRPLAY_NAME}" should now appear in the AirPlay menu on your devices.
 DONE

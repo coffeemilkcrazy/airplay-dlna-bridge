@@ -140,7 +140,7 @@ class Config:
 
 
 def env_names(persist_only: bool = True) -> list[str]:
-    """Variable names for install-pi.sh and deploy.sh, so the shell never
+    """Variable names for install.sh and deploy.sh, so the shell never
     hardcodes the list."""
     return [s.env for s in SETTINGS if s.persist or not persist_only]
 

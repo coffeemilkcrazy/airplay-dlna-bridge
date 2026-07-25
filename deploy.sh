@@ -78,13 +78,13 @@ while read -r var; do
     RUNTIME_ENV+=" ${var}=$(printf '%q' "${!var-}")"
 done < <(python3 "$SRC/bridge/config.py" --env-names)
 
-ssh -t "$PI" "chmod +x $REMOTE_TMP/install-pi.sh && sudo \
+ssh -t "$PI" "chmod +x $REMOTE_TMP/install.sh && sudo \
     AIRPLAY2='$AIRPLAY2' \
     REBUILD='$REBUILD' \
     SHAIRPORT_VERBOSITY='$SHAIRPORT_VERBOSITY' \
     BITPERFECT='$BITPERFECT' \
    ${RUNTIME_ENV} \
-    $REMOTE_TMP/install-pi.sh '$SOUNDBAR_IP' '$AIRPLAY_NAME'"
+    $REMOTE_TMP/install.sh '$SOUNDBAR_IP' '$AIRPLAY_NAME'"
 
 printf '\n\033[1m==> Done\033[0m\n'
 echo "Follow the log with:  ssh $PI 'journalctl -u airplay-soundbar -f'"
