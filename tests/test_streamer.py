@@ -223,8 +223,8 @@ class TestLiveWavServer(unittest.TestCase):
         return buf.decode(errors="ignore")
 
     def test_url_for(self):
-        self.assertEqual(self.srv.url_for("10.0.0.5"),
-                         f"http://10.0.0.5:{self.port}/t.wav")
+        self.assertEqual(self.srv.url_for("192.0.2.30"),
+                         f"http://192.0.2.30:{self.port}/t.wav")
 
     def test_head_advertises_dlna_streaming(self):
         s = self._request("HEAD")

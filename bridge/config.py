@@ -145,9 +145,41 @@ def env_names(persist_only: bool = True) -> list[str]:
     return [s.env for s in SETTINGS if s.persist or not persist_only]
 
 
+def launchd_plist(app_dir: str, label: str = "com.airplay-dlna-bridge",
+                  log_path: str = "/tmp/airplay-dlna-bridge.log",
+                  env: dict | None = None) -> bytes:
+    """Build the macOS LaunchAgent plist.
+
+    Written with plistlib rather than assembled in the shell: values land in
+    XML, and a device named "Kitchen & Den" produces a malformed plist that
+    launchd silently refuses to load. plistlib escapes correctly, and Python
+    is already a dependency.
+    """
+    import plistlib
+
+    source = os.environ if env is None else env
+    variables = {name: source.get(name, "") for name in env_names()
+                 if source.get(name, "") != ""}
+
+    return plistlib.dumps({
+        "Label": label,
+        "ProgramArguments": ["/usr/bin/env", "python3",
+                             os.path.join(app_dir, "bridge.py")],
+        "EnvironmentVariables": variables,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": log_path,
+        "StandardErrorPath": log_path,
+    })
+
+
 if __name__ == "__main__":
     if "--env-names" in sys.argv:
         print("\n".join(env_names()))
+    elif "--launchd-plist" in sys.argv:
+        i = sys.argv.index("--launchd-plist")
+        app_dir = sys.argv[i + 1] if len(sys.argv) > i + 1 else "."
+        sys.stdout.buffer.write(launchd_plist(app_dir))
     elif "--app-version" in sys.argv:
         print(APP_VERSION)
     else:

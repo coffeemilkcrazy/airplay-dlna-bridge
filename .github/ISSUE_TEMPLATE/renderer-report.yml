@@ -1,0 +1,66 @@
+name: Renderer report
+description: Tell us whether a speaker, soundbar or receiver works
+title: "[renderer] "
+labels: ["renderer-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Only a Samsung HW-N850 has been verified. Reports from any other
+        device are the most useful thing you can contribute — including
+        the ones that do not work.
+
+  - type: input
+    id: device
+    attributes:
+      label: Make and model
+      placeholder: e.g. Sonos Play:5, Yamaha RX-V6A, Denon HEOS
+    validations:
+      required: true
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Outcome
+      options:
+        - Works fully
+        - Plays, but with problems
+        - Discovered, but never plays
+        - Not discovered at all
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnose
+    attributes:
+      label: Output of tools/diagnose.py
+      description: |
+        `python3 tools/diagnose.py` — this is the single most useful thing to
+        include. It shows what was discovered, whether the control plane
+        answers, and whether the device actually fetches audio.
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host running the bridge
+      options:
+        - Raspberry Pi OS / Debian / Ubuntu
+        - Fedora
+        - Arch
+        - macOS
+        - Other Linux
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: |
+        Symptoms the diagnostic does not capture — audible glitches, drops
+        after a while, behaviour that differs between tracks.
+    validations:
+      required: false

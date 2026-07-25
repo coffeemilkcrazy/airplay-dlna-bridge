@@ -64,7 +64,12 @@ fi
 BRIDGE_VERSION="${BRIDGE_VERSION:-$GIT_REV}"
 
 printf '\n\033[1m==> Deploying %s to %s\033[0m\n' "$BRIDGE_VERSION" "$PI"
-ssh "$PI" "rm -rf $REMOTE_TMP && mkdir -p $REMOTE_TMP"
+# Quoted on the remote side so a path with spaces cannot split the argument.
+# This is an rm -rf on someone else's machine, so refuse to run it blind.
+[[ -n "$REMOTE_TMP" && "$REMOTE_TMP" == /tmp/* ]] || {
+    echo "refusing to clear unexpected staging path: $REMOTE_TMP" >&2; exit 1; }
+# shellcheck disable=SC2029  # deliberate: expand locally, quote for the remote
+ssh "$PI" "rm -rf '$REMOTE_TMP' && mkdir -p '$REMOTE_TMP'"
 rsync -av --delete \
     --exclude '__pycache__' \
     "$SRC/bridge/" "$PI:$REMOTE_TMP/"

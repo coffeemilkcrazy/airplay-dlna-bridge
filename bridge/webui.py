@@ -53,10 +53,15 @@ PAGE = """<!doctype html>
   .np { display: flex; gap: 14px; align-items: center; }
   .art {
     width: 64px; height: 64px; border-radius: 10px; flex: none;
-    object-fit: cover; background: var(--bg);
-    border: 1px solid var(--line); display: none;
+    background: var(--bg) center/cover no-repeat;
+    border: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 24px; line-height: 1;
   }
-  .art.show { display: block; }
+  /* Placeholder glyph shows only while there is no cover art, so the slot is
+     always occupied and the card height never jumps when a track starts. */
+  .art::after { content: "\\266A"; opacity: .45; }
+  .art.has-art::after { content: none; }
   .np-text { min-width: 0; flex: 1; }
   .np-title {
     font-size: 18px; font-weight: 600; margin: 0 0 2px;
@@ -157,7 +162,7 @@ PAGE = """<!doctype html>
 
   <div class="card">
     <div class="np">
-      <img class="art" id="art" alt="">
+      <div class="art" id="art" aria-hidden="true"></div>
       <div class="np-text">
         <div class="np-title" id="title">Not playing</div>
         <div class="np-sub" id="sub"></div>
@@ -278,14 +283,14 @@ PAGE = """<!doctype html>
     if (art.available) {
       if (art.version !== artVersion) {
         artVersion = art.version;
-        $("art").src = "/artwork?v=" + artVersion +
-          (token ? "&token=" + encodeURIComponent(token) : "");
+        $("art").style.backgroundImage = 'url("/artwork?v=' + artVersion +
+          (token ? "&token=" + encodeURIComponent(token) : "") + '")';
       }
-      $("art").classList.add("show");
-    } else {
+      $("art").classList.add("has-art");
+    } else if (artVersion !== -1) {
       artVersion = -1;
-      $("art").classList.remove("show");
-      $("art").removeAttribute("src");
+      $("art").style.backgroundImage = "";
+      $("art").classList.remove("has-art");
     }
 
     // Transport needs the sender's DACP credentials, which only arrive once

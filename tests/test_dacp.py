@@ -128,7 +128,7 @@ class TestCrossPlatformResolution(unittest.TestCase):
                                side_effect=lambda c: "/usr/bin/" + c
                                if c == "avahi-browse" else None), \
              mock.patch.object(dacp, "_resolve_avahi",
-                               return_value=("10.0.0.1", 1)) as a, \
+                               return_value=("192.0.2.40", 1)) as a, \
              mock.patch.object(dacp, "_resolve_dnssd") as d:
             resolve_dacp("ABC123")
         a.assert_called_once()
@@ -197,7 +197,7 @@ class TestSend(unittest.TestCase):
         """A stale endpoint must not be retried forever."""
         r = DacpRemote()
         with mock.patch.object(dacp, "resolve_dacp",
-                               return_value=("10.0.0.1", 3689)), \
+                               return_value=("192.0.2.40", 3689)), \
              mock.patch.object(dacp.urllib.request, "urlopen",
                                side_effect=OSError("refused")):
             ok, detail = r.send("play", "ABC123", "tok")
@@ -207,7 +207,7 @@ class TestSend(unittest.TestCase):
 
     def test_endpoint_is_cached_between_commands(self):
         with mock.patch.object(dacp, "resolve_dacp",
-                               return_value=("10.0.0.1", 3689)) as resolver, \
+                               return_value=("192.0.2.40", 3689)) as resolver, \
              mock.patch.object(dacp.urllib.request, "urlopen",
                                return_value=mock.MagicMock(
                                    __enter__=lambda s: s,

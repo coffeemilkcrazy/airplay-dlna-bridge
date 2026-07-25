@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor the README claims; 3.13 is what Debian trixie
+        # ships, which is what the Raspberry Pi path actually runs.
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # The panel's JavaScript is executed under Node against a stub DOM.
+      # Without it those tests skip rather than fail, so CI must supply it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # No pip install step: the suite is standard library only, and a
+      # dependency creeping in should break here rather than on someone's Pi.
+      - name: Run tests
+        run: ./run-tests.sh
+      - name: Run tests with warnings as errors
+        # Catches resource leaks - unclosed sockets and file handles - which
+        # otherwise only surface as exhaustion after days of uptime.
+        run: python3 -W error::ResourceWarning -m unittest discover -s tests -t .
+
+  macos:
+    name: Tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # The DACP resolver shells out to dns-sd here and avahi-browse on Linux,
+      # so the suite genuinely differs by platform.
+      - name: Run tests
+        run: ./run-tests.sh
+
+  shell:
+    name: Shell lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck bridge/install.sh deploy.sh run-tests.sh \
+                     tools/verify-platforms.sh
+      - name: Scripts parse
+        run: |
+          for f in bridge/install.sh deploy.sh run-tests.sh \
+                   tools/verify-platforms.sh; do
+            bash -n "$f"
+          done
+
+  packages:
+    name: Package names resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # install.sh installs packages with sudo on other people's machines
+      # across four package managers, only one of which gets daily use. A
+      # renamed or dropped package should fail here, not there.
+      - name: Verify platform package availability
+        run: ./tools/verify-platforms.sh
+
+  hygiene:
+    name: No private data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The repo was scrubbed of the development environment before release.
+      # This stops it creeping back in via an example or a default.
+      - name: Check for real LAN addresses and account names
+        run: |
+          # 192.0.2.0/24 and 198.51.100.0/24 are RFC 5737 documentation ranges
+          # and are the only literal addresses allowed.
+          if grep -rInE '192\.168\.[0-9]+\.[0-9]+|10\.[0-9]+\.[0-9]+\.[0-9]+' \
+               --include='*.py' --include='*.sh' --include='*.md' \
+               --include='*.yml' . ; then
+            echo "::error::Private LAN address found - use 192.0.2.x instead"
+            exit 1
+          fi
+          echo "clean"

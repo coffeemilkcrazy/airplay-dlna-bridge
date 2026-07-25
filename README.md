@@ -298,11 +298,25 @@ Standard-library `unittest` only, so it runs unchanged on the host. Nothing need
 real hardware or a browser: UPnP runs against a fake renderer, the metadata
 reader against a temporary FIFO, and DACP against captured `avahi-browse` output.
 
-Run with warnings promoted to errors to catch resource leaks:
+The panel's JavaScript is executed too, not just checked for strings:
+`tests/test_webui_js.py` extracts the `<script>` block and runs it under Node
+against a stub DOM, covering the slider settle window, request coalescing and
+the polling lifecycle. Those tests skip if Node is absent.
+
+Beyond the suite:
 
 ```bash
-python3 -W error::ResourceWarning -m unittest discover -s tests -t .
+python3 -W error::ResourceWarning -m unittest discover -s tests -t .  # leaks
+shellcheck bridge/install.sh deploy.sh run-tests.sh tools/*.sh        # shell
+./tools/verify-platforms.sh                     # package names, in containers
 ```
+
+`verify-platforms.sh` matters because `install.sh` installs packages with sudo
+across four package managers, only one of which sees daily use. It resolves
+every package name in throwaway Debian, Fedora and Arch containers, so a
+renamed or dropped package fails here rather than on a stranger's machine.
+
+CI runs all of it on Linux and macOS, across Python 3.11 and 3.13.
 
 Several past bugs have explicit regression cover, because each was **silent** —
 the system reported healthy while sounding wrong:
@@ -328,6 +342,8 @@ the system reported healthy while sounding wrong:
 | `deploy.sh` | workstation | Copies to a remote host and runs the installer |
 | `tools/diagnose.py` | either | End-to-end health check — run this first |
 | `tools/level.py` | either | Measures the live stream in dBFS |
+| `tools/demo-panel.py` | either | Serves the panel with fake data, for UI work |
+| `tools/verify-platforms.sh` | either | Checks package names across apt/dnf/pacman |
 
 ## Troubleshooting
 
@@ -398,11 +414,10 @@ disabled.
 
 ## Contributing
 
-Issues and pull requests welcome — especially reports from renderers other than
-the HW-N850, since that is the only hardware this has been verified against.
-
-Please run `./run-tests.sh` before opening a PR, and add cover for behaviour a
-test could have caught.
+See [CONTRIBUTING.md](CONTRIBUTING.md). The most useful contribution is a
+report from a renderer other than the HW-N850 — that is the only hardware any
+of this has been verified against. There is an
+[issue template](.github/ISSUE_TEMPLATE/renderer-report.yml) for it.
 
 ## License
 
