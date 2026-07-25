@@ -363,8 +363,31 @@ test could have caught.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+**[PolyForm Noncommercial 1.0.0](LICENSE)** — free for education, research,
+personal and hobby use. **Commercial use is not permitted.**
 
-Builds on [shairport-sync](https://github.com/mikebrady/shairport-sync) and
-[nqptp](https://github.com/mikebrady/nqptp) by Mike Brady, which do the actual
-AirPlay work.
+Permitted, per the licence text:
+
+- Personal study, experiment, hobby projects and private use
+- Educational institutions, public research organisations, charities,
+  government and public-health bodies — regardless of how they are funded
+
+Not permitted: anything with an anticipated commercial application, including
+selling it, bundling it into a product, or running it as part of a commercial
+service. If you want a commercial licence, open an issue.
+
+Note this is a *source-available* licence, not an open-source one — the
+[OSI definition](https://opensource.org/osd) requires permitting commercial
+use. Everything else about the project is unchanged: the source is public,
+issues and pull requests are welcome, and you may modify and redistribute it
+for any noncommercial purpose.
+
+### Third-party components
+
+This bridge drives, but does not include or modify, two GPL programs by Mike
+Brady — they are installed from source on the Pi and run as separate processes:
+
+- [shairport-sync](https://github.com/mikebrady/shairport-sync) — the AirPlay receiver
+- [nqptp](https://github.com/mikebrady/nqptp) — PTP timing for AirPlay 2
+
+They remain under their own licences, which this one does not affect.
