@@ -492,6 +492,19 @@ class TestWebUi(unittest.TestCase):
         for marker in ("src=\"http", "href=\"http", "@import"):
             self.assertNotIn(marker, body)
 
+    def test_playing_indicator_is_css_only_and_accessible(self):
+        """The equaliser is decorative: it must not be announced to screen
+        readers, must be driven by CSS rather than a JS timer, and must have a
+        reduced-motion fallback."""
+        port = self._start()
+        body = self._fetch(port, "/")[2].decode()
+        self.assertIn('id="eq"', body)
+        self.assertIn('aria-hidden="true"', body)
+        self.assertIn("@keyframes eq", body)
+        self.assertIn("prefers-reduced-motion", body)
+        # toggled from the same signal as the status dot
+        self.assertIn('$("eq").classList.toggle("on", active)', body)
+
     def test_page_drives_the_real_endpoints(self):
         port = self._start()
         body = self._fetch(port, "/")[2].decode()

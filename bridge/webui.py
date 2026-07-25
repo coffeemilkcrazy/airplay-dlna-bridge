@@ -65,6 +65,28 @@ PAGE = """<!doctype html>
   .np-sub { color: var(--muted); font-size: 14px; min-height: 21px;
             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .np-meta { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+
+  /* Playing indicator. Purely decorative - the state pill carries the actual
+     information - so it is aria-hidden and animated in CSS rather than by a
+     timer, which keeps it off the main thread and costs nothing when idle. */
+  .eq { display: none; align-items: flex-end; gap: 2px; height: 15px; }
+  .eq.on { display: inline-flex; }
+  .eq i {
+    display: block; width: 3px; height: 30%; border-radius: 1px;
+    background: var(--ok);
+    animation: eq 900ms ease-in-out infinite;
+  }
+  .eq i:nth-child(2) { animation-duration: 640ms; animation-delay: -220ms; }
+  .eq i:nth-child(3) { animation-duration: 1150ms; animation-delay: -480ms; }
+  .eq i:nth-child(4) { animation-duration: 780ms; animation-delay: -90ms; }
+  @keyframes eq {
+    0%, 100% { height: 25%; }
+    50%      { height: 100%; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    /* Still shows that audio is playing, just without the motion. */
+    .eq i { animation: none; height: 60%; }
+  }
   .pill {
     display: inline-block; padding: 2px 9px; border-radius: 999px;
     background: var(--bg); border: 1px solid var(--line);
@@ -142,6 +164,7 @@ PAGE = """<!doctype html>
       </div>
     </div>
     <div class="np-meta">
+      <span class="eq" id="eq" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
       <span class="pill" id="state">&mdash;</span>
       <span class="pill" id="elapsed">&mdash;</span>
     </div>
@@ -238,6 +261,8 @@ PAGE = """<!doctype html>
 
     var active = !!d.session_active;
     $("dot").className = "dot " + (active ? "live" : "idle");
+    // Same signal as the status dot: audio has flowed recently.
+    $("eq").classList.toggle("on", active);
 
     var title = (np.title || "").trim(), artist = (np.artist || "").trim(),
         album = (np.album || "").trim();

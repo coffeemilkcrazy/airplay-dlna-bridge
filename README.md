@@ -13,7 +13,8 @@ see what is playing and control volume, mute and playback.
 
 <p align="center">
   <img src="docs/web-panel.png" alt="The web control panel: now playing with
-  cover art, transport buttons, a capped volume slider, and live bridge status"
+  cover art, a playing equaliser, transport buttons, a capped volume slider,
+  and live bridge status"
   width="420">
   <br>
   <sub>Placeholder data — the page itself is served by the bridge.</sub>
@@ -118,7 +119,8 @@ AirPlay menu.
 
 Open **`http://<host>:8772/`** from any device on the network.
 
-- Now playing — title, artist, album, cover art, elapsed time
+- Now playing — title, artist, album, cover art, elapsed time, and an
+  equaliser that animates while audio is flowing
 - **Play / pause / skip**, plus a volume slider and mute
 - Live state: AirPlay session, attached renderers, audio sent, version
 - Refreshes every 2s, and says plainly when the bridge or speaker is unreachable
