@@ -1,0 +1,36 @@
+[Unit]
+Description=AirPlay to Samsung soundbar bridge
+After=network-online.target avahi-daemon.service nqptp.service
+Wants=network-online.target
+Requires=avahi-daemon.service
+# nqptp provides the PTP clock AirPlay 2 needs. It is absent on an AirPlay 1
+# install, so this is Wants (optional) rather than Requires.
+Wants=nqptp.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/airplay-soundbar/bridge.env
+ExecStart=/usr/bin/python3 /opt/airplay-soundbar/bridge.py
+Restart=always
+RestartSec=5
+
+# shairport-sync needs realtime scheduling for glitch-free audio.
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+Nice=-10
+
+NoNewPrivileges=true
+ProtectHome=true
+# 'full' rather than 'strict': shairport-sync is a source build under
+# /usr/local and needs a writable /tmp for its metadata pipe.
+ProtectSystem=full
+PrivateTmp=false
+ReadWritePaths=/tmp
+StateDirectory=airplay-soundbar
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=airplay-soundbar
+
+[Install]
+WantedBy=multi-user.target
