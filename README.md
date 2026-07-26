@@ -1,5 +1,7 @@
 # airplay-dlna-bridge
 
+[![CI](https://github.com/coffeemilkcrazy/airplay-dlna-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/coffeemilkcrazy/airplay-dlna-bridge/actions/workflows/ci.yml)
+
 Give an **AirPlay 2 receiver** to any speaker that only speaks UPnP/DLNA.
 
 Plenty of networked speakers, soundbars and AV receivers expose a UPnP
