@@ -526,9 +526,22 @@ class Bridge:
             "last_error": self.last_error,
         }
 
+    def create_status_server(self):
+        """Bind the status server without starting to serve.
+
+        Separated from _serve_status so a caller can know the socket is
+        listening before it uses it. Binding inside the serving thread means
+        anyone connecting immediately afterwards is racing thread startup,
+        which shows up as an inexplicable connection timeout on a loaded
+        machine rather than as an obvious failure.
+        """
+        if self._status_httpd is None:
+            self._status_httpd = api.make_server(self)
+        return self._status_httpd
+
     def _serve_status(self) -> None:
         try:
-            self._status_httpd = api.make_server(self)
+            self.create_status_server()
         except OSError as e:
             log.warning("status API disabled: %s", e)
             return

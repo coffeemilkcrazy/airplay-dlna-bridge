@@ -263,11 +263,12 @@ class TestStatusApiAuth(unittest.TestCase):
         b = Bridge(Config(soundbar_ip="127.0.0.1", status_port=port,
                           status_bind="127.0.0.1", status_token=token))
         b.bar = CountingBar()
-        threading.Thread(target=b._serve_status, daemon=True).start()
-        for _ in range(50):
-            if b._status_httpd:
-                break
-            time.sleep(0.05)
+        # Bind synchronously, then serve. Starting the thread and waiting for
+        # it to bind races thread startup, which on a slow machine surfaces as
+        # a connection timeout rather than an obvious failure.
+        b.create_status_server()
+        threading.Thread(target=b._status_httpd.serve_forever,
+                         daemon=True).start()
         def cleanup():
             if b._status_httpd:
                 b._status_httpd.shutdown()
@@ -336,11 +337,12 @@ class TestArtworkAndTransport(unittest.TestCase):
         b = Bridge(Config(soundbar_ip="127.0.0.1", status_port=port,
                           status_bind="127.0.0.1", status_token=token))
         b.bar = CountingBar()
-        threading.Thread(target=b._serve_status, daemon=True).start()
-        for _ in range(50):
-            if b._status_httpd:
-                break
-            time.sleep(0.05)
+        # Bind synchronously, then serve. Starting the thread and waiting for
+        # it to bind races thread startup, which on a slow machine surfaces as
+        # a connection timeout rather than an obvious failure.
+        b.create_status_server()
+        threading.Thread(target=b._status_httpd.serve_forever,
+                         daemon=True).start()
 
         def cleanup():
             if b._status_httpd:
@@ -445,11 +447,12 @@ class TestWebUi(unittest.TestCase):
         b = Bridge(Config(soundbar_ip="127.0.0.1", status_port=port,
                           status_bind="127.0.0.1", status_token=token))
         b.bar = CountingBar()
-        threading.Thread(target=b._serve_status, daemon=True).start()
-        for _ in range(50):
-            if b._status_httpd:
-                break
-            time.sleep(0.05)
+        # Bind synchronously, then serve. Starting the thread and waiting for
+        # it to bind races thread startup, which on a slow machine surfaces as
+        # a connection timeout rather than an obvious failure.
+        b.create_status_server()
+        threading.Thread(target=b._status_httpd.serve_forever,
+                         daemon=True).start()
 
         def cleanup():
             if b._status_httpd:
@@ -560,11 +563,12 @@ class TestVolumeEndpointCapping(unittest.TestCase):
         b = Bridge(Config(soundbar_ip="127.0.0.1", status_port=port,
                           status_bind="127.0.0.1", max_volume=max_volume))
         b.bar = CountingBar()
-        threading.Thread(target=b._serve_status, daemon=True).start()
-        for _ in range(50):
-            if b._status_httpd:
-                break
-            time.sleep(0.05)
+        # Bind synchronously, then serve. Starting the thread and waiting for
+        # it to bind races thread startup, which on a slow machine surfaces as
+        # a connection timeout rather than an obvious failure.
+        b.create_status_server()
+        threading.Thread(target=b._status_httpd.serve_forever,
+                         daemon=True).start()
 
         def cleanup():
             if b._status_httpd:
