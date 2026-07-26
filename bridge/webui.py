@@ -143,6 +143,29 @@ PAGE = """<!doctype html>
        font-variant-numeric: tabular-nums; overflow: hidden;
        text-overflow: ellipsis; white-space: nowrap; }
 
+  /* Settings are folded away by default: they are the rarely-used part of the
+     panel, and the phone-first layout has no room to spare above the fold. */
+  details.card > summary {
+    cursor: pointer; font-weight: 600; list-style: none;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  details.card > summary::-webkit-details-marker { display: none; }
+  details.card > summary::after { content: "\\25be"; color: var(--muted); }
+  details.card[open] > summary::after { content: "\\25b4"; }
+  .field { margin-top: 14px; }
+  .field > .row { display: flex; align-items: center; gap: 10px; }
+  .field label { color: var(--muted); font-size: 13px; flex: none;
+                 min-width: 120px; }
+  .field input {
+    flex: 1; min-width: 0; padding: 9px 10px; font: inherit; font-size: 14px;
+    color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  .why { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .why.pending { color: var(--accent); }
+  .note { margin-top: 12px; font-size: 13px; }
+  .note.bad { color: var(--bad); }
+
   .foot { text-align: center; color: var(--muted); font-size: 12px; margin-top: 6px; }
   .err { background: rgba(220,38,38,.1); border-color: rgba(220,38,38,.35);
          color: var(--bad); }
@@ -190,6 +213,7 @@ PAGE = """<!doctype html>
       <button id="down">&minus;1</button>
       <button id="up">+1</button>
       <button id="mute">Mute</button>
+      <button id="power">Turn off</button>
     </div>
   </div>
 
@@ -198,10 +222,23 @@ PAGE = """<!doctype html>
       <dt>AirPlay session</dt><dd id="session">&mdash;</dd>
       <dt>Streaming to</dt><dd id="active">&mdash;</dd>
       <dt>Audio sent</dt><dd id="bytes">&mdash;</dd>
+      <dt>Auto-off</dt><dd id="autooff">&mdash;</dd>
       <dt>Soundbar</dt><dd id="ip">&mdash;</dd>
       <dt>Build</dt><dd id="build">&mdash;</dd>
     </dl>
   </div>
+
+  <details class="card" id="setwrap">
+    <summary>Settings</summary>
+    <div id="setform"></div>
+    <div class="btns">
+      <button id="setsave">Save</button>
+    </div>
+    <div class="note hide" id="setnote"></div>
+    <div class="btns hide" id="setrestart">
+      <button id="dorestart">Restart now</button>
+    </div>
+  </details>
 
   <div class="foot" id="foot">connecting&hellip;</div>
 </div>
@@ -247,6 +284,18 @@ PAGE = """<!doctype html>
     return n.toFixed(i ? 1 : 0) + " " + u[i];
   }
 
+  // The bridge decides whether a countdown is running - it owns the rules
+  // about when auto-off is armed - and sends a number only when there is one.
+  function autoOffText(pw) {
+    if (!pw.auto_off_minutes) return "disabled";
+    if (typeof pw.seconds_until_off !== "number") {
+      return pw.off ? "powered off" : "\\u2014";
+    }
+    var s = Math.max(0, pw.seconds_until_off);
+    return s >= 90 ? "in " + Math.round(s / 60) + " min"
+                   : "in " + Math.round(s) + " s";
+  }
+
   function banner(msg) {
     var b = $("banner");
     if (!msg) { b.classList.add("hide"); return; }
@@ -256,7 +305,7 @@ PAGE = """<!doctype html>
 
   function render(d) {
     var bar = d.soundbar || {}, np = d.now_playing || {}, st = d.stream || {};
-    var art = d.artwork || {}, tr = d.transport || {};
+    var art = d.artwork || {}, tr = d.transport || {}, pw = d.power || {};
 
     $("devname").textContent = d.airplay_name || "Soundbar";
     // Release version in the header; the git revision goes in the detail list
@@ -330,6 +379,12 @@ PAGE = """<!doctype html>
     var muted = !!bar.muted;
     $("mute").textContent = muted ? "Unmute" : "Mute";
     $("mute").classList.toggle("on", muted);
+
+    // 'on' marks the button as the way back, matching how mute reads.
+    var isOff = !!pw.off;
+    $("power").textContent = isOff ? "Turn on" : "Turn off";
+    $("power").classList.toggle("on", isOff);
+    $("autooff").textContent = autoOffText(pw);
 
     $("session").textContent = active ? "active" : "idle";
     $("active").textContent = st.active
@@ -457,6 +512,120 @@ PAGE = """<!doctype html>
     this.textContent = on ? "Unmute" : "Mute";
     api("/mute/" + (on ? "on" : "off"), { method: "POST" })
       .catch(function () {}).then(poll);
+  });
+
+  // ---- settings ---------------------------------------------------------
+  // Built from /settings rather than written out here, so the bridge's table
+  // of editable options stays the only place they are declared. Only ever
+  // rebuilt on open and after a save: the 2s poll must never overwrite a
+  // field someone is halfway through typing into.
+  var fields = {};
+
+  function setNote(text, bad, offerRestart) {
+    var note = $("setnote");
+    note.textContent = text;
+    note.classList.toggle("bad", !!bad);
+    note.classList.remove("hide");
+    $("setrestart").classList.toggle("hide", !offerRestart);
+  }
+
+  function buildSettings(items) {
+    var form = $("setform");
+    form.replaceChildren();
+    fields = {};
+    items.forEach(function (item) {
+      var wrap = document.createElement("div");
+      wrap.className = "field";
+      var row = document.createElement("div");
+      row.className = "row";
+
+      var label = document.createElement("label");
+      label.textContent = item.env;
+      var input = document.createElement("input");
+      input.type = item.kind === "str" ? "text" : "number";
+      if (input.type === "number") input.step = item.kind === "int" ? "1" : "any";
+      input.value = item.value;
+
+      var why = document.createElement("div");
+      why.className = "why";
+      // A saved value that is not the running one is exactly the mismatch
+      // worth naming, rather than letting the form imply it took effect.
+      why.textContent = item.pending
+        ? "saved \\u2014 restart to apply (running: " + item.running + ")"
+        : item.help;
+      why.classList.toggle("pending", !!item.pending);
+
+      row.appendChild(label);
+      row.appendChild(input);
+      wrap.appendChild(row);
+      wrap.appendChild(why);
+      form.appendChild(wrap);
+      fields[item.env] = input;
+    });
+  }
+
+  function loadSettings() {
+    return api("/settings")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; })
+      .then(function (d) {
+        if (d && d.settings) buildSettings(d.settings);
+        else setNote("Could not read the settings.", true);
+      });
+  }
+
+  function saveSettings() {
+    var body = {};
+    Object.keys(fields).forEach(function (env) { body[env] = fields[env].value; });
+    api("/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+      .then(function (r) { return r.json().catch(function () { return null; }); })
+      .catch(function () { return null; })
+      .then(function (out) {
+        if (!out) return setNote("Could not save.", true);
+        if (!out.ok) {
+          var field = Object.keys(out.errors || {})[0];
+          return setNote(field
+            ? field + ": " + out.errors[field] : "Save failed.", true);
+        }
+        var needs = out.restart_required || [];
+        setNote(needs.length
+          ? "Saved. " + needs.join(", ") + " will apply after a restart."
+          : "Saved.", false, needs.length > 0);
+        loadSettings();
+      });
+  }
+
+  $("setwrap").addEventListener("toggle", function () {
+    if (this.open) loadSettings();
+  });
+  $("setsave").addEventListener("click", saveSettings);
+
+  $("dorestart").addEventListener("click", function () {
+    this.disabled = true;
+    api("/restart", { method: "POST" })
+      .catch(function () { return null; })
+      .then(function () {
+        setNote("Restarting\\u2026 the panel reconnects on its own.", false);
+      });
+  });
+
+  $("power").addEventListener("click", function () {
+    var turnOn = this.classList.contains("on");
+    api("/power/" + (turnOn ? "on" : "off"), { method: "POST" })
+      .then(function (r) {
+        return r.json().catch(function () { return null; });
+      })
+      .catch(function () { return null; })
+      .then(function (body) {
+        // A power method that silently did nothing looks exactly like one that
+        // worked, so say when the bridge reports it failed.
+        if (body && body.ok === false) banner(body.detail || "Power command failed");
+        setTimeout(poll, 400);
+      });
   });
 
   function transport(cmd) {

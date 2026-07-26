@@ -270,6 +270,13 @@ class Soundbar:
         try:
             with urllib.request.urlopen(url, timeout=timeout) as r:
                 return r.read().decode(errors="ignore")
+        except urllib.error.HTTPError as e:
+            # Same open socket as in upnp(). It matters more here: a WAM
+            # failure is a routine outcome rather than an exception - most
+            # renderers answer nothing at all - so leaking one per attempt
+            # would accumulate for the life of the process.
+            e.close()
+            raise SoundbarError(f"WAM {command[:40]}: {e}") from e
         except Exception as e:
             raise SoundbarError(f"WAM {command[:40]}: {e}") from e
 
@@ -285,6 +292,25 @@ class Soundbar:
             "mac": _text(xml, "spkmacaddr"),
             "group": _text(xml, "grouptype"),
         }
+
+    def wam_power(self, on: bool, timeout: float = 6) -> str:
+        """Power the speaker on or off over the WAM API.
+
+        UNVERIFIED ON HW-* SOUNDBARS. SetPowerStatus is what the WAM/R-series
+        speakers this protocol targets use; soundbars implement only a subset,
+        and an unsupported command gets no response at all rather than an error
+        (see wam_play_url), so it surfaces as a SoundbarError after `timeout`.
+
+        Callers must therefore read a failure as "this device cannot be powered
+        over the network" and fall back to something else, not as a transient
+        fault worth retrying. Probe a real device with:
+
+            python3 tools/diagnose.py --test-power
+        """
+        return self.wam(
+            "<name>SetPowerStatus</name>"
+            f'<p type="dec" name="powerstatus" val="{1 if on else 0}"/>',
+            timeout=timeout)
 
     def wam_play_url(self, url: str, buffersize: int = 0) -> str:
         """Ask the speaker to fetch and play a URL directly (no UPnP).

@@ -15,6 +15,7 @@ Usage:
     python3 tools/diagnose.py                # discover automatically
     python3 tools/diagnose.py 192.0.2.10     # target a known IP
     python3 tools/diagnose.py --no-audio     # skip the audible tone test
+    python3 tools/diagnose.py --test-power   # also switch it off and on again
 """
 
 from __future__ import annotations
@@ -94,10 +95,66 @@ def tone_producer(bc: PcmBroadcaster, stop: threading.Event,
         time.sleep(max(0, next_tick - time.monotonic()))
 
 
+def probe_power(bar) -> int:
+    """Does this renderer accept a WAM power command at all?
+
+    Opt-in, because passing means the speaker really does switch off. Whether
+    HW-* soundbars implement SetPowerStatus is unverified - they answer only a
+    subset of the WAM API and never reply at all to the rest - so this is how
+    to find out for a given device instead of guessing. AUTO_OFF depends on the
+    answer: no WAM power means POWER_OFF_COMMAND is the only route.
+    """
+    print(f"\n{BOLD}5. Power control{RESET}  "
+          f"{DIM}the speaker will switch off and back on{RESET}")
+
+    try:
+        bar.wam_power(False)
+        ok("WAM accepted power-off")
+    except SoundbarError as e:
+        bad(f"WAM power-off: {e}")
+        print("      No network power-off of its own. Drive a smart plug or a")
+        print("      hub instead, and the bridge will use that:")
+        print("        POWER_OFF_COMMAND='curl -fsS -X POST http://plug/off' \\")
+        print("        POWER_ON_COMMAND='curl -fsS -X POST http://plug/on' \\")
+        print("        AUTO_OFF=30 ./deploy.sh")
+        return 1
+
+    # Accepting the command is not the same as acting on it - a device that
+    # answers and stays on is exactly the silent failure this project keeps
+    # running into, so confirm it actually went away.
+    for _ in range(5):
+        time.sleep(2)
+        if not bar.is_reachable(timeout=2):
+            ok("stopped answering - it really did power down")
+            break
+    else:
+        warn("still answering: it accepted the command but stayed on")
+
+    info("waking it again ...")
+    try:
+        bar.wam_power(True)
+        ok("WAM accepted power-on")
+    except SoundbarError as e:
+        bad(f"WAM power-on: {e}")
+        print("      It powers off but cannot be woken over the network. Set")
+        print("      POWER_ON_COMMAND, or leave AUTO_OFF disabled - otherwise")
+        print("      the speaker needs its remote after every idle period.")
+        return 1
+
+    for _ in range(8):
+        time.sleep(2)
+        if bar.is_reachable(timeout=2):
+            ok("answering again")
+            return 0
+    warn("did not come back within the wait - check it by hand")
+    return 1
+
+
 # --------------------------------------------------------------------------- #
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     play_audio = "--no-audio" not in sys.argv
+    test_power = "--test-power" in sys.argv
     failures = 0
 
     print(f"\n{BOLD}AirPlay bridge diagnostics{RESET}")
@@ -189,7 +246,7 @@ def main() -> int:
     if not play_audio:
         print(f"\n{GREEN}Control plane healthy.{RESET} "
               "Re-run without --no-audio to test playback.")
-        return 0
+        return probe_power(bar) if test_power else 0
 
     print(f"\n{BOLD}4. Playback test{RESET}  (quiet 440 Hz tone, ~16s)")
     print(f"  {DIM}drives bridge/streamer.py - the real audio path{RESET}")
@@ -289,6 +346,9 @@ def main() -> int:
     else:
         bad(f"unstable: states={states}")
         failures += 1
+
+    if test_power:
+        failures += probe_power(bar)
 
     print()
     if failures == 0:

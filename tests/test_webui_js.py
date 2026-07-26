@@ -115,6 +115,55 @@ class TestPanelBehaviour(unittest.TestCase):
         """Dragging must not queue a backlog of stale values on a slow link."""
         self.assertBehaviour("only one volume request in flight")
 
+    # -- power --------------------------------------------------------------- #
+    def test_auto_off_countdown_rendered(self):
+        self.assertBehaviour("auto-off countdown shown")
+
+    def test_auto_off_states_are_distinguishable(self):
+        """'disabled', 'powered off' and a live countdown must not look alike."""
+        self.assertBehaviour("auto-off disabled reads plainly")
+        self.assertBehaviour("powered off stated plainly")
+
+    def test_power_button_offers_the_opposite_state(self):
+        self.assertBehaviour("power button offers off")
+        self.assertBehaviour("power button offers the way back")
+
+    def test_deliberate_off_is_not_reported_as_a_fault(self):
+        self.assertBehaviour("no error banner for a speaker we switched off")
+
+    def test_power_off_posts_and_reports_failure(self):
+        self.assertBehaviour("power off POSTed")
+        self.assertBehaviour("failed power command explained")
+
+    # -- settings ------------------------------------------------------------ #
+    def test_form_is_generated_from_the_bridge(self):
+        """The panel must not carry its own copy of the settings table."""
+        self.assertBehaviour("settings form built from the bridge")
+        self.assertBehaviour("editable setting labelled by its variable")
+        self.assertBehaviour("numeric setting gets a numeric input")
+
+    def test_saved_value_shown_and_pending_state_named(self):
+        """A value that is saved but not yet running is the mismatch worth
+        spelling out, not glossing over."""
+        self.assertBehaviour("saved value shown, not the running one")
+        self.assertBehaviour("pending setting says a restart is needed")
+        self.assertBehaviour("pending setting names the running value")
+        self.assertBehaviour("settled setting shows its help instead")
+
+    def test_save_posts_every_field(self):
+        self.assertBehaviour("settings POSTed as JSON")
+        self.assertBehaviour("every field sent, keyed by variable")
+
+    def test_restart_is_offered_and_never_automatic(self):
+        self.assertBehaviour("save reports what needs a restart")
+        self.assertBehaviour("restart offered, not performed")
+        self.assertBehaviour("restart not requested until asked")
+        self.assertBehaviour("restart requested on demand")
+
+    def test_rejected_value_is_explained(self):
+        self.assertBehaviour("rejected value names the field")
+        self.assertBehaviour("rejected value gives the reason")
+
     # -- polling lifecycle --------------------------------------------------- #
     def test_polling_stops_when_hidden(self):
         self.assertBehaviour("polling stops when hidden")

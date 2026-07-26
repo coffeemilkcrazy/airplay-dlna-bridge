@@ -22,10 +22,12 @@ function eq(label, got, want) {
 // --------------------------------------------------------------------------
 function makeEl(id) {
   const classes = new Set();
-  return {
+  const el = {
     id, textContent: '', value: '0', max: '12', disabled: false,
     src: null, title: '', style: {}, _handlers: {},
-    className: '',
+    type: '', step: '', open: false, children: [],
+    appendChild(child) { this.children.push(child); return child; },
+    replaceChildren(...nodes) { this.children = nodes; },
     classList: {
       add: c => classes.add(c),
       remove: c => classes.delete(c),
@@ -37,16 +39,47 @@ function makeEl(id) {
     addEventListener(ev, fn) { (this._handlers[ev] ||= []).push(fn); },
     fire(ev, self) { (this._handlers[ev] || []).forEach(fn => fn.call(self || this)); },
   };
+  // className and classList are two views of one thing in a browser. Keeping
+  // them as separate properties here let an element be styled by one and
+  // asserted through the other, which is a way for a stub to disagree with
+  // reality and pass anyway.
+  Object.defineProperty(el, 'className', {
+    get: () => [...classes].join(' '),
+    set(value) {
+      classes.clear();
+      String(value).split(/\s+/).filter(Boolean).forEach(c => classes.add(c));
+    },
+  });
+  return el;
 }
 
 const els = {};
 const IDS = ['dot', 'devname', 'ver', 'build', 'banner', 'title', 'sub', 'art',
              'state', 'elapsed', 'vol', 'volval', 'volmax', 'mute', 'up',
              'down', 'session', 'active', 'bytes', 'ip', 'foot', 'eq',
-             'prev', 'playpause', 'next'];
+             'prev', 'playpause', 'next', 'power', 'autooff',
+             'setwrap', 'setform', 'setsave', 'setnote', 'setrestart',
+             'dorestart'];
 IDS.forEach(id => { els[id] = makeEl(id); });
 
+// The settings form is generated from /settings, so the stub has to be able to
+// make elements as well as look them up. Flattening the tree is enough for the
+// assertions: what matters is the inputs' values and where they are sent.
+function flatten(el, out = []) {
+  (el.children || []).forEach(child => { out.push(child); flatten(child, out); });
+  return out;
+}
+global.settingInputs = () => flatten(els.setform).filter(e => e.tagName === 'INPUT');
+global.settingLabels = () => flatten(els.setform).filter(e => e.tagName === 'LABEL');
+global.settingNotes = () => flatten(els.setform).filter(
+  e => e.classList.contains('why'));
+
 global.document = {
+  createElement(tag) {
+    const el = makeEl('');
+    el.tagName = tag.toUpperCase();
+    return el;
+  },
   getElementById: id => els[id],
   addEventListener(ev, fn) { (this._h ||= {}); (this._h[ev] ||= []).push(fn); },
   hidden: false,
@@ -107,6 +140,8 @@ function payload(over = {}) {
     transport: { available: true },
     soundbar: { ip: '192.0.2.10', model: 'Renderer', state: 'PLAYING',
                 volume: 7, muted: false, elapsed: '0:01:00', max_volume: 12 },
+    power: { auto_off_minutes: 30, off: false, seconds_until_off: null,
+             last_result: '' },
     stream: { url: '', connections: 1, active: 1, bytes: 1048576 },
     last_error: '',
   };
@@ -145,6 +180,40 @@ function respondWith(data) {
   eq('idle title', els.title.textContent, 'Not playing');
   check('equaliser off when idle', !els.eq.classList.contains('on'));
   check('transport disabled without sender', els.prev.disabled === true);
+
+  // ---- power state -----------------------------------------------------
+  // The bridge decides whether a countdown is running; the panel must render
+  // exactly what it is sent rather than reimplementing the arming rules.
+  respondWith(payload({
+    session_active: false,
+    power: { auto_off_minutes: 30, off: false, seconds_until_off: 1080,
+             last_result: '' },
+  }));
+  document._fire('visibilitychange');
+  await flush(); await flush();
+  eq('auto-off countdown shown', els.autooff.textContent, 'in 18 min');
+  eq('power button offers off', els.power.textContent, 'Turn off');
+
+  respondWith(payload({
+    session_active: false,
+    power: { auto_off_minutes: 30, off: true, seconds_until_off: null,
+             last_result: 'powered off (idle for 30 min) via wam' },
+    soundbar: { state: 'off', volume: null, muted: false, max_volume: 12 },
+  }));
+  document._fire('visibilitychange');
+  await flush(); await flush();
+  eq('power button offers the way back', els.power.textContent, 'Turn on');
+  eq('powered off stated plainly', els.autooff.textContent, 'powered off');
+  check('no error banner for a speaker we switched off',
+        !/not responding/.test(els.banner.textContent));
+
+  respondWith(payload({
+    power: { auto_off_minutes: 0, off: false, seconds_until_off: null,
+             last_result: '' },
+  }));
+  document._fire('visibilitychange');
+  await flush(); await flush();
+  eq('auto-off disabled reads plainly', els.autooff.textContent, 'disabled');
 
   // ---- streaming without metadata --------------------------------------
   respondWith(payload({ now_playing: { title: '  ', artist: '', album: '' } }));
@@ -192,6 +261,106 @@ function respondWith(data) {
   document._fire('visibilitychange');
   await flush();
   check('polling resumes when visible', intervalCount() === before);
+
+  // ---- power button ------------------------------------------------------
+  calls.length = 0;
+  respondWith(payload());
+  document._fire('visibilitychange');
+  await flush(); await flush();
+  setResponder(p => ({
+    ok: true, status: 200,
+    json: async () => (String(p).indexOf('/power/') === 0
+      ? { ok: false, detail: 'cannot power this renderer off' }
+      : payload()),
+  }));
+  calls.length = 0;
+  els.power.fire('click', els.power);
+  await flush(); await flush();
+  const powerCall = calls.find(c => String(c.path).indexOf('/power/') === 0);
+  eq('power off POSTed', powerCall && powerCall.path, '/power/off');
+  // A power method that quietly did nothing looks just like one that worked.
+  check('failed power command explained',
+        /cannot power/.test(els.banner.textContent));
+
+  // ---- settings form -----------------------------------------------------
+  const SETTINGS = {
+    settings: [
+      { env: 'AIRPLAY_NAME', help: 'name shown in the AirPlay menu',
+        value: 'Kitchen', running: 'Soundbar', kind: 'str', live: false,
+        pending: true },
+      { env: 'AUTO_OFF', help: 'minutes of silence before powering off',
+        value: 30, running: 30, kind: 'float', live: true, pending: false },
+    ],
+    restart_pending: true,
+  };
+  setResponder(p => ({
+    ok: true, status: 200,
+    json: async () => (String(p).indexOf('/settings') === 0 ? SETTINGS : payload()),
+  }));
+  calls.length = 0;
+  els.setwrap.open = true;
+  els.setwrap.fire('toggle', els.setwrap);
+  await flush(); await flush();
+
+  eq('settings form built from the bridge', settingInputs().length, 2);
+  eq('editable setting labelled by its variable',
+     settingLabels().map(e => e.textContent), ['AIRPLAY_NAME', 'AUTO_OFF']);
+  eq('saved value shown, not the running one',
+     settingInputs().map(e => e.value), ['Kitchen', 30]);
+  eq('numeric setting gets a numeric input',
+     settingInputs().map(e => e.type), ['text', 'number']);
+  // The mismatch is the point: a saved value that is not in effect yet.
+  check('pending setting says a restart is needed',
+        /restart to apply/.test(settingNotes()[0].textContent));
+  check('pending setting names the running value',
+        /Soundbar/.test(settingNotes()[0].textContent));
+  check('settled setting shows its help instead',
+        /minutes of silence/.test(settingNotes()[1].textContent));
+
+  // Saving posts every field, and the restart prompt only appears when
+  // something actually needs one.
+  calls.length = 0;
+  setResponder((p, opts) => ({
+    ok: true, status: 200,
+    json: async () => (String(p) === '/settings' && opts && opts.method === 'POST'
+      ? { ok: true, applied: { AIRPLAY_NAME: 'Kitchen' },
+          restart_required: ['AIRPLAY_NAME'] }
+      : SETTINGS),
+  }));
+  settingInputs()[0].value = 'Kitchen';
+  els.setsave.fire('click', els.setsave);
+  await flush(); await flush(); await flush();
+
+  const saveCall = calls.find(c => c.opts && c.opts.method === 'POST');
+  check('settings POSTed as JSON', !!saveCall && !!saveCall.opts.body);
+  eq('every field sent, keyed by variable',
+     Object.keys(JSON.parse(saveCall.opts.body)).sort(),
+     ['AIRPLAY_NAME', 'AUTO_OFF']);
+  check('save reports what needs a restart',
+        /restart/i.test(els.setnote.textContent));
+  check('restart offered, not performed',
+        !els.setrestart.classList.contains('hide'));
+  check('restart not requested until asked',
+        !calls.some(c => String(c.path) === '/restart'));
+
+  els.dorestart.fire('click', els.dorestart);
+  await flush(); await flush();
+  check('restart requested on demand',
+        calls.some(c => String(c.path) === '/restart'));
+
+  // A rejected value must name the field rather than failing vaguely.
+  setResponder((p, opts) => ({
+    ok: false, status: 400,
+    json: async () => (opts && opts.method === 'POST'
+      ? { ok: false, errors: { STREAM_PORT: 'port must be between 1 and 65535' } }
+      : SETTINGS),
+  }));
+  els.setsave.fire('click', els.setsave);
+  await flush(); await flush(); await flush();
+  check('rejected value names the field',
+        /STREAM_PORT/.test(els.setnote.textContent));
+  check('rejected value gives the reason',
+        /between 1 and 65535/.test(els.setnote.textContent));
 
   // ---- unauthorised -----------------------------------------------------
   setResponder(() => ({ ok: false, status: 401, json: async () => ({}) }));

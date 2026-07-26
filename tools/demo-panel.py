@@ -22,6 +22,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bridge"))
 
 import api  # noqa: E402
+from config import (BY_ENV, Config, apply_settings,  # noqa: E402
+                    describe_editable, env_text)
 
 
 def demo_artwork(size: int = 320) -> bytes:
@@ -49,6 +51,8 @@ def demo_artwork(size: int = 320) -> bytes:
 
 
 ART = demo_artwork()
+DEMO_NAME = "Living Room Soundbar"
+DEMO_CFG = Config(airplay_name=DEMO_NAME)
 
 
 class FakeMetadata:
@@ -94,7 +98,7 @@ class FakeBridge:
 
     def snapshot(self):
         return {
-            "airplay_name": "Living Room Soundbar",
+            "airplay_name": DEMO_NAME,
             "version": "1.1",
             "revision": "a1b2c3d",
             "session_active": PLAYING,
@@ -106,10 +110,47 @@ class FakeBridge:
             "soundbar": {"ip": "192.0.2.10", "model": "DLNA Renderer",
                          "state": "PLAYING" if PLAYING else "STOPPED", "volume": 7, "muted": False,
                          "elapsed": "0:02:14" if PLAYING else "", "max_volume": 12},
+            # Playing shows the default configuration, where auto-off is off.
+            # A countdown only exists once a session has ended, so the idle
+            # state is the only place one can honestly be shown.
+            "power": {"auto_off_minutes": 0.0 if PLAYING else 30.0,
+                      "off": False,
+                      "seconds_until_off": None if PLAYING else 1080.0,
+                      "last_result": ""},
             "stream": {"url": "http://192.0.2.5:8770/airplay.wav",
                        "connections": 1, "active": 1, "bytes": 23_068_672},
             "last_error": "",
         }
+
+    def power_on(self, wait: bool = True):
+        return True, "demo"
+
+    def power_off(self, reason: str, manual: bool = False):
+        return True, "demo"
+
+    # The settings form is genuinely driven and genuinely validated - only the
+    # writing is left out, so a demo run cannot rewrite a real bridge.env.
+    def settings_snapshot(self):
+        return {"settings": describe_editable(DEMO_CFG),
+                "restart_pending": False,
+                "config_file": "(demo - nothing is written)"}
+
+    def update_settings(self, changes):
+        applied, errors = apply_settings(DEMO_CFG, changes)
+        if errors:
+            return False, {"ok": False, "errors": errors}
+        # Same comparison the real bridge makes: the panel posts every field,
+        # so only what differs from the running value has actually changed.
+        applied = {env: value for env, value in applied.items()
+                   if value != getattr(DEMO_CFG, BY_ENV[env].name)}
+        return True, {
+            "ok": True,
+            "applied": {k: env_text(v) for k, v in applied.items()},
+            "restart_required": [k for k in applied if not BY_ENV[k].live],
+        }
+
+    def request_restart(self):
+        return True, "demo - not really restarting"
 
 
 httpd = api.make_server(FakeBridge())

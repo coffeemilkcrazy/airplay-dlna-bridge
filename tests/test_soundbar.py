@@ -9,6 +9,7 @@ import socket
 import sys
 import threading
 import unittest
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -44,6 +45,26 @@ class FakeRenderer:
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
+
+            def do_GET(self):
+                """The Samsung WAM API: GET /UIC?cmd=<url-encoded XML>.
+
+                On real hardware this is a different port from the SOAP
+                endpoint; tests point both at this one server. Recorded like
+                the SOAP calls, tagged so assertions can tell them apart.
+                """
+                outer.requests.append(("WAM", self.path))
+                if outer.fail_next:
+                    outer.fail_next = False
+                    self.send_response(500)
+                    self.end_headers()
+                    return
+                payload = b"<UIC><method>PowerStatus</method></UIC>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/xml")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
@@ -227,6 +248,45 @@ class TestUpnpCalls(unittest.TestCase):
         bar = Soundbar(ip="127.0.0.1", dmr_port=1)     # nothing listening
         with self.assertRaises(SoundbarError):
             bar.get_volume()
+
+
+class TestWamPower(unittest.TestCase):
+    """The power command auto-off depends on. What matters most is that a
+    renderer which will not do it raises, so the bridge falls back instead of
+    believing the speaker went off."""
+
+    def setUp(self):
+        self.fake = FakeRenderer()
+        self.bar = Soundbar(ip="127.0.0.1", dmr_port=self.fake.port,
+                            wam_port=self.fake.port)
+
+    def tearDown(self):
+        self.fake.stop()
+
+    def _sent(self) -> str:
+        kind, path = self.fake.last()
+        self.assertEqual(kind, "WAM")
+        return urllib.parse.unquote(path)
+
+    def test_power_off_sends_zero(self):
+        self.bar.wam_power(False)
+        sent = self._sent()
+        self.assertIn("<name>SetPowerStatus</name>", sent)
+        self.assertIn('val="0"', sent)
+
+    def test_power_on_sends_one(self):
+        self.bar.wam_power(True)
+        self.assertIn('val="1"', self._sent())
+
+    def test_unsupported_command_raises(self):
+        self.fake.fail_next = True
+        with self.assertRaises(SoundbarError):
+            self.bar.wam_power(False)
+
+    def test_unreachable_device_raises(self):
+        bar = Soundbar(ip="127.0.0.1", wam_port=1)     # nothing listening
+        with self.assertRaises(SoundbarError):
+            bar.wam_power(True)
 
 
 class TestReachability(unittest.TestCase):

@@ -51,9 +51,11 @@ python3 tools/demo-panel.py            # playing, with cover art
 python3 tools/demo-panel.py --idle     # nothing playing
 ```
 
-That serves the real page and the real API routes against invented data, which
-is also how `docs/web-panel.png` is produced — please regenerate it if you
-change the layout.
+That serves the real page and the real API routes against invented data —
+including the settings form, which is genuinely validated there, only without
+writing anything. It is also how `docs/web-panel.png` and
+`docs/web-panel-settings.png` are produced; please regenerate them if you change
+the layout.
 
 Its JavaScript is genuinely tested: `tests/test_webui_js.py` extracts the
 `<script>` block and executes it under Node against a stub DOM, so the slider,

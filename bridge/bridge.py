@@ -44,7 +44,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import api                                                   # noqa: E402
-from config import APP_VERSION, Config                       # noqa: E402
+from config import (APP_VERSION, BY_ENV, Config,             # noqa: E402
+                    apply_settings, describe_editable, env_text,
+                    read_env_file, write_env_file)
 from dacp import DacpRemote                                  # noqa: E402
 from metadata import MetadataReader                          # noqa: E402
 from soundbar import Soundbar, SoundbarError                 # noqa: E402
@@ -61,6 +63,58 @@ STATUS_TIMEOUT = 2.0
 STATUS_CACHE_SECONDS = 2.0
 # Don't re-run SSDP on every failed engage attempt.
 REDISCOVER_COOLDOWN = 30.0
+# A power command talks to a plug or a hub, so it should be quick. Bound it:
+# the session loop waits on it.
+POWER_COMMAND_TIMEOUT = 20.0
+# How long a woken renderer gets to rejoin the network before we push to it.
+WAKE_TIMEOUT = 20.0
+WAKE_POLL_SECONDS = 1.0
+# Long enough for the HTTP response to reach the panel before we exit.
+RESTART_DELAY = 0.4
+# The WAM 'function' that means network audio - the only input that is ours.
+# Everything else (hdmi, bt, optical, aux, soundshare, ...) is someone using
+# the speaker for something this bridge cannot see.
+NETWORK_INPUT = "wifi"
+
+
+def restart_process() -> None:
+    """Exit so the service manager starts us again.
+
+    Exiting is the portable way to restart: the systemd unit is Restart=always
+    and the LaunchAgent is KeepAlive, so both bring the bridge straight back,
+    and neither needs this process to shell out to a service manager it may not
+    be allowed to drive. Run from a terminal with no supervisor, it just stops
+    - which the API response says.
+    """
+    os._exit(0)
+
+
+def run_command(command: str) -> tuple[bool, str]:
+    """Run a user-configured power command.
+
+    The only place this process runs a shell, so it is the only place to audit.
+    shell=True is deliberate and not an injection hole: the string is a whole
+    command the operator wrote (`curl -X POST http://plug/off`, a pipeline, an
+    IR blaster invocation), it is read from the root-owned config file that
+    install.sh writes, and no API route can set or influence it. Splitting it
+    into an argv list would break every command that needs a shell without
+    closing anything, since there is no untrusted input to inject.
+
+    The command itself is never logged: it typically carries a webhook URL with
+    a token in it, and the log goes to the journal.
+    """
+    try:
+        proc = subprocess.run(command, shell=True, capture_output=True,
+                              timeout=POWER_COMMAND_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, f"command timed out after {POWER_COMMAND_TIMEOUT:.0f}s"
+    except OSError as e:
+        return False, f"command could not run: {e}"
+
+    if proc.returncode == 0:
+        return True, "command succeeded"
+    lines = proc.stderr.decode(errors="ignore").strip().splitlines()
+    return False, f"command exited {proc.returncode}: {lines[-1] if lines else '(no stderr)'}"
 
 
 class ReengagePolicy:
@@ -98,6 +152,65 @@ class ReengagePolicy:
         return True
 
 
+class AutoOffPolicy:
+    """Decides when to power the renderer off after a spell of silence.
+
+    Two rules matter more than the timer itself.
+
+    *Never before the first session.* PcmBroadcaster.seconds_since_audio is
+    infinite until something has played, so a bare threshold check would power
+    the speaker off shortly after every restart - conceivably in the middle of
+    a film someone is watching on it. The countdown only starts once this
+    process has held a session and that session has ended.
+
+    *One attempt per idle period.* Whether the attempt worked or not, it is not
+    repeated until audio returns. A speaker the user switched back on by hand
+    is left alone, and a method that does not work does not fail every second
+    for the rest of the night.
+    """
+
+    def __init__(self, seconds: float):
+        self.seconds = max(0.0, seconds)
+        self.armed = False
+        self.fired = False
+        self.disabled_reason = ""
+
+    @property
+    def enabled(self) -> bool:
+        return self.seconds > 0 and not self.disabled_reason
+
+    def disable(self, reason: str) -> None:
+        """Stop trying for the life of the process. Used when there is no way
+        to power this device off at all - a fact that will not change until
+        someone reconfigures and restarts the bridge."""
+        self.disabled_reason = reason
+
+    def session_started(self) -> None:
+        self.armed = False
+        self.fired = False
+
+    def session_ended(self) -> None:
+        self.armed = True
+        self.fired = False
+
+    def should_fire(self, quiet_seconds: float) -> bool:
+        return (self.enabled and self.armed and not self.fired
+                and quiet_seconds >= self.seconds)
+
+    def record_fired(self) -> None:
+        self.fired = True
+
+    def seconds_remaining(self, quiet_seconds: float) -> float | None:
+        """Countdown for /status, or None when there is nothing to count down.
+
+        Returning None rather than a number is what lets the web panel show or
+        hide the countdown without reimplementing the arming rules.
+        """
+        if not self.enabled or not self.armed or self.fired:
+            return None
+        return max(0.0, self.seconds - quiet_seconds)
+
+
 def local_ip_towards(host: str) -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -118,6 +231,12 @@ class Bridge:
         self.dacp = DacpRemote()
         self.session_active = False
         self.last_error = ""
+        self.auto_off = AutoOffPolicy(cfg.auto_off_seconds)
+        self.powered_off = False
+        self.power_result = ""       # last power action, surfaced in /status
+        self._off_method = ""        # "wam" | "command"; its inverse wakes it
+        self._suppress_wake = False  # an explicit off outranks a live session
+        self._input_readable = False  # has this renderer ever reported its input
 
         self._stop = threading.Event()
         self._proc: subprocess.Popen | None = None
@@ -259,9 +378,158 @@ class Bridge:
         except SoundbarError as e:
             log.debug("min-volume check failed: %s", e)
 
+    # -- power ----------------------------------------------------------- #
+    def power_off(self, reason: str, manual: bool = False) -> tuple[bool, str]:
+        """Power the renderer down: WAM first, the configured command second.
+
+        Which one succeeds is remembered, because only its inverse can be
+        relied on to undo it. A smart plug that cut the power leaves nothing on
+        the network to answer WAM, so waking has to go back through the plug.
+
+        `manual` marks a request from the API. A live AirPlay session would
+        otherwise wake the speaker again on the very next tick, so an explicit
+        off holds until the user asks for it back or a new session begins.
+        """
+        if self.powered_off:
+            return True, "already off"
+
+        wam_detail = ""
+        if self.bar:
+            try:
+                self.bar.wam_power(False)
+                return self._record_power_off("wam", reason, manual)
+            except SoundbarError as e:
+                wam_detail = str(e)
+
+        if self.cfg.power_off_command:
+            ok, detail = run_command(self.cfg.power_off_command)
+            if ok:
+                return self._record_power_off("command", reason, manual)
+            return self._power_failed(f"power-off command failed: {detail}")
+
+        # Nothing available. Say so once and stop asking: this is a
+        # configuration fact, not a transient failure.
+        self.auto_off.disable("no power-off method available")
+        return self._power_failed(
+            "cannot power this renderer off: WAM did not answer"
+            + (f" ({wam_detail})" if wam_detail else "")
+            + " and POWER_OFF_COMMAND is not set")
+
+    def power_on(self, wait: bool = True) -> tuple[bool, str]:
+        """Wake the renderer with the inverse of whatever powered it off.
+
+        `wait` is for the session loop, which must not push UPnP at a speaker
+        whose Wi-Fi is still coming up. The API passes wait=False: a button
+        press should not hold an HTTP request open for the whole wake, and the
+        panel sees the speaker return on its next poll anyway.
+        """
+        if not self.powered_off:
+            return True, "already on"
+
+        if self._off_method == "command":
+            if not self.cfg.power_on_command:
+                return self._power_failed(
+                    "powered off by POWER_OFF_COMMAND but POWER_ON_COMMAND is "
+                    "not set - the speaker has to be switched on by hand")
+            ok, detail = run_command(self.cfg.power_on_command)
+            if not ok:
+                return self._power_failed(f"power-on command failed: {detail}")
+        else:
+            try:
+                self.bar.wam_power(True)
+            except SoundbarError as e:
+                return self._power_failed(f"WAM power-on failed: {e}")
+
+        self.powered_off = False
+        self._suppress_wake = False
+        self.power_result = "powered on"
+        self.invalidate_soundbar_cache()
+        if wait:
+            log.info("powered on - waiting for the renderer to answer")
+            self._await_renderer()
+        else:
+            log.info("powered on")
+        return True, "powered on"
+
+    def _record_power_off(self, method: str, reason: str,
+                          manual: bool = False) -> tuple[bool, str]:
+        self._off_method = method
+        self.powered_off = True
+        self._suppress_wake = manual
+        self.power_result = f"powered off ({reason}) via {method}"
+        self.invalidate_soundbar_cache()
+        log.info("%s", self.power_result)
+        return True, self.power_result
+
+    def _power_failed(self, message: str) -> tuple[bool, str]:
+        # Loud, and visible in /status: a power action that quietly did nothing
+        # looks exactly like one that worked.
+        self.power_result = message
+        log.error("%s", message)
+        return False, message
+
+    def _await_renderer(self) -> bool:
+        """Give a woken speaker time to rejoin the network.
+
+        A wake is not instant - its Wi-Fi has to come back - and an engage
+        attempt that lands too early counts against ReengagePolicy, which backs
+        off after three and then stays off for the rest of the session.
+        """
+        deadline = time.monotonic() + WAKE_TIMEOUT
+        while time.monotonic() < deadline and not self._stop.is_set():
+            if self.bar and self.bar.is_reachable(timeout=1.0):
+                return True
+            time.sleep(WAKE_POLL_SECONDS)
+        log.warning("renderer did not answer within %.0fs of waking",
+                    WAKE_TIMEOUT)
+        return False
+
+    def _renderer_in_use(self) -> str:
+        """Why the renderer must not be powered off now, or "" if it may be.
+
+        Two separate questions, because they catch different situations:
+
+        *Is it playing?* AVTransport reports what the renderer's own media
+        engine is doing, which catches another DLNA controller having pushed
+        something to it after we let go.
+
+        *What input is it on?* AVTransport says nothing at all about HDMI-ARC,
+        optical or Bluetooth: a soundbar playing a film through ARC looks
+        exactly like an idle one. Samsung's WAM GetFunc does answer that, and is
+        one of the commands the HW-N850 answers instantly. Only `wifi` is ours -
+        anything else means the speaker is in use for something the bridge
+        cannot see, and powering it off would cut it dead mid-film.
+
+        Unknowable is not the same as free, but it cannot mean "never power
+        off" either, or the feature would not work on any renderer without a
+        WAM API. So: fail open for a device that has never answered GetFunc,
+        and fail closed for one that used to and has stopped.
+        """
+        try:
+            if self.bar.transport_state(timeout=STATUS_TIMEOUT) == "PLAYING":
+                return "it is playing something else"
+        except SoundbarError:
+            pass          # unreachable over UPnP; the input may still answer
+
+        try:
+            function = (self.bar.wam_function()[0] or "").lower()
+        except SoundbarError:
+            if self._input_readable:
+                # It answered before, so silence now is a fault, not an
+                # absence. Leave the speaker alone rather than guess.
+                return "its input could not be checked"
+            return ""     # no WAM API at all: nothing to consult, carry on
+
+        self._input_readable = True
+        if function and function != NETWORK_INPUT:
+            return f"it is on its {function} input"
+        return ""
+
     def _release_soundbar(self) -> None:
         try:
-            if self.bar:
+            # A Stop aimed at a speaker we already powered off just burns the
+            # full UPnP timeout, which on shutdown delays the whole service.
+            if self.bar and not self.powered_off:
                 self.bar.stop()
                 log.info("soundbar released")
         except SoundbarError as e:
@@ -416,13 +684,25 @@ class Bridge:
             if want != self.session_active:
                 self.session_active = want
                 log.info("AirPlay session %s", "started" if want else "ended")
-                if not want:
+                if want:
+                    self.auto_off.session_started()
+                    # A new session is a fresh instruction: it clears an
+                    # earlier manual off, which only outranked the session it
+                    # was issued during.
+                    self._suppress_wake = False
+                else:
                     self.metadata.reset_track()
                     # Re-probe next session: shairport-sync can renegotiate
                     # rate/format between senders.
                     self._fmt_checked = False
                     self._fmt_probe.clear()
                     policy.reset()
+                    self.auto_off.session_ended()
+
+            # A session on a speaker we switched off: wake it before anything
+            # else tries to talk to it, and before the engage attempt below.
+            if want and self.powered_off and not self._suppress_wake:
+                self.power_on()
 
             if want and not engaged and policy.may_engage():
                 engaged = self._engage_soundbar()
@@ -431,6 +711,19 @@ class Bridge:
             elif not want and engaged:
                 self._release_soundbar()
                 engaged = False
+            elif not want and self.auto_off.should_fire(quiet):
+                # Marked fired first: one attempt per idle period, whether or
+                # not it works, so a failing method cannot retry every second.
+                self.auto_off.record_fired()
+                in_use = self._renderer_in_use()
+                if in_use:
+                    # Recorded, not just logged: "why didn't it turn off?" is
+                    # otherwise only answerable from the journal.
+                    self.power_result = f"auto power-off skipped - {in_use}"
+                    log.info("%s", self.power_result)
+                else:
+                    self.power_off(
+                        f"idle for {self.cfg.auto_off_minutes:g} min")
             elif engaged and time.monotonic() - last_check > 10:
                 last_check = time.monotonic()
                 try:
@@ -474,6 +767,14 @@ class Bridge:
 
             result = {"state": "unknown", "volume": None, "muted": None,
                       "elapsed": ""}
+            if self.powered_off:
+                # Don't query a device we switched off: every poll would stall
+                # for the full timeout and report an error we already know the
+                # cause of.
+                result["state"] = "off"
+                self._bar_cache = result
+                self._bar_cache_at = time.monotonic()
+                return dict(result)
             if self.bar:
                 try:
                     result["state"] = self.bar.transport_state(
@@ -515,6 +816,15 @@ class Bridge:
                 "elapsed": bar["elapsed"],
                 "max_volume": self.cfg.max_volume,
             },
+            "power": {
+                "auto_off_minutes": self.cfg.auto_off_minutes,
+                "off": self.powered_off,
+                # None unless a countdown is genuinely running, so the panel
+                # does not have to reimplement the arming rules.
+                "seconds_until_off": self.auto_off.seconds_remaining(
+                    self.broadcaster.seconds_since_audio),
+                "last_result": self.power_result,
+            },
             "stream": {
                 "url": self._stream_url() if self.server else "",
                 # 'connections' is a lifetime total; 'active' is how many
@@ -525,6 +835,73 @@ class Bridge:
             },
             "last_error": self.last_error,
         }
+
+    # -- settings --------------------------------------------------------- #
+    def settings_snapshot(self) -> dict:
+        items = describe_editable(self.cfg,
+                                  read_env_file(self.cfg.config_dir))
+        return {"settings": items,
+                "restart_pending": any(i["pending"] for i in items),
+                "config_file": os.path.join(self.cfg.config_dir, "bridge.env")}
+
+    def update_settings(self, changes: dict) -> tuple[bool, dict]:
+        """Validate, persist, and apply what can be applied now.
+
+        Saving and applying are deliberately separate. Everything is written to
+        bridge.env, but only the settings the session loop re-reads each tick
+        take effect immediately; the rest keep running on their old values
+        until a restart, and `pending` in the snapshot says so rather than
+        letting the panel imply otherwise.
+        """
+        applied, errors = apply_settings(self.cfg, changes)
+        if errors:
+            return False, {"ok": False, "errors": errors}
+
+        # The panel posts the whole form, so most of what arrives is already
+        # in force. Comparing against the running value is what keeps "needs a
+        # restart" meaning something: it is exactly the set that is saved but
+        # not yet in effect, which is also true of an earlier save nobody has
+        # restarted for yet.
+        applied = {env: value for env, value in applied.items()
+                   if value != getattr(self.cfg, BY_ENV[env].name)}
+        if not applied:
+            return True, {"ok": True, "applied": {}, "restart_required": []}
+
+        ok, detail = write_env_file(
+            self.cfg.config_dir,
+            {env: env_text(value) for env, value in applied.items()})
+        if not ok:
+            log.error("could not save settings: %s", detail)
+            return False, {"ok": False, "errors": {"": detail}}
+
+        restart_required = []
+        for env_name, value in applied.items():
+            setting = BY_ENV[env_name]
+            if setting.live:
+                setattr(self.cfg, setting.name, value)
+            else:
+                restart_required.append(env_name)
+        # Live values still go through the cross-field rules, and the auto-off
+        # policy holds its own copy of the threshold.
+        self.cfg.normalise()
+        self.auto_off.seconds = max(0.0, self.cfg.auto_off_seconds)
+        log.info("settings saved: %s", ", ".join(sorted(applied)))
+        return True, {"ok": True,
+                      "applied": {k: env_text(v) for k, v in applied.items()},
+                      "restart_required": restart_required}
+
+    def request_restart(self) -> tuple[bool, str]:
+        threading.Thread(target=self._restart_soon, daemon=True).start()
+        return True, "restarting - the service manager will bring it back"
+
+    def _restart_soon(self) -> None:
+        time.sleep(RESTART_DELAY)
+        log.info("restarting to apply settings")
+        try:
+            self.stop()
+        except Exception as e:      # we are exiting regardless
+            log.debug("shutdown before restart: %s", e)
+        restart_process()
 
     def create_status_server(self):
         """Bind the status server without starting to serve.

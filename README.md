@@ -126,7 +126,9 @@ Open **`http://<host>:8772/`** from any device on the network.
 - Now playing — title, artist, album, cover art, elapsed time, and an
   equaliser that animates while audio is flowing
 - **Play / pause / skip**, plus a volume slider and mute
+- **Turn the speaker off**, and the auto-off countdown when one is armed
 - Live state: AirPlay session, attached renderers, audio sent, version
+- A **Settings** panel for the everyday options, saved on the host
 - Refreshes every 2s, and says plainly when the bridge or speaker is unreachable
 
 Self-contained: no CDN, no build step, no internet access needed on the host. It
@@ -139,12 +141,42 @@ nothing about tracks. That uses DACP credentials shairport-sync learns once
 playback has started, so those buttons stay disabled until you have played
 something. Volume and mute act on the speaker and always work.
 
+### Settings from the panel
+
+The panel's **Settings** section edits the everyday options without a deploy.
+Saving writes `bridge.env` on the host, which the installer carries forward, so
+a change survives the next `./deploy.sh` — while a value passed explicitly to
+the installer still wins.
+
+<p align="center">
+  <img src="docs/web-panel-settings.png" alt="The settings panel: one field per
+  editable option, each with its help text and a Save button"
+  width="420">
+</p>
+
+`IDLE_STOP` and `AUTO_OFF` take effect at once. The rest are read at startup, so
+saving them offers a **Restart now** button; until you take it, the field says
+what is saved *and* what is still running, rather than implying the change is
+live. Restarting exits the process and lets systemd or launchd start it again,
+which drops any AirPlay session in progress.
+
+Deliberately **not** editable here, each for its own reason:
+
+| Setting | Why not |
+|---|---|
+| `MAX_VOLUME`, `MIN_VOLUME` | The cap is enforced server-side precisely so no client can raise it |
+| `POWER_OFF_COMMAND`, `POWER_ON_COMMAND` | They run a shell as the service user, and the panel is on the LAN with no token by default |
+| `STATUS_BIND`, `STATUS_PORT`, `STATUS_TOKEN` | A wrong value makes the panel unreachable from the panel |
+| `SHAIRPORT_*`, `METADATA_PIPE` | Paths the installer owns |
+
+Set those with `./deploy.sh` or by editing `bridge.env` on the host.
+
 ## Configuration
 
 Every runtime setting is declared once in `bridge/config.py`. That table
 generates the command-line flags, the environment variables, the `bridge.env`
-the installer writes, and the list `deploy.sh` forwards — so adding an option
-means one line, not four files.
+the installer writes, the list `deploy.sh` forwards, and the panel's settings
+form — so adding an option means one line, not five places.
 
 ```bash
 python3 bridge/config.py              # every setting and its default
@@ -166,6 +198,9 @@ MAX_VOLUME=20 STATUS_TOKEN=$(openssl rand -hex 16) ./deploy.sh
 | `STATUS_TOKEN` | *(none)* | Require a token for the API |
 | `STATUS_BIND` | `0.0.0.0` | `127.0.0.1` keeps the panel off the LAN |
 | `IDLE_STOP` | `20` | Seconds of silence before releasing the speaker |
+| `AUTO_OFF` | `0` | Minutes of silence before powering it off; `0` disables |
+| `POWER_OFF_COMMAND` | *(none)* | Runs when the speaker has no network power-off |
+| `POWER_ON_COMMAND` | *(none)* | Its inverse, used to wake the speaker |
 
 ### Volume cap
 
@@ -178,6 +213,67 @@ capped request still succeeds, and says what happened:
 ```json
 {"ok": true, "volume": 12, "requested": 80, "max_volume": 12, "capped": true}
 ```
+
+### Auto power-off
+
+Releasing the speaker after `IDLE_STOP` frees it for TV or Bluetooth but leaves
+it powered on. `AUTO_OFF` switches it off after a longer silence:
+
+```bash
+AUTO_OFF=30 ./deploy.sh            # off after 30 minutes with no AirPlay audio
+```
+
+It is off by default, and the countdown appears in the web panel. The next
+AirPlay session wakes the speaker before pushing to it.
+
+Three rules keep it from switching off a speaker someone is using:
+
+- **Never before the first session** of the process. Otherwise restarting the
+  bridge would power off a speaker someone is watching a film through.
+- **Never while the renderer is playing something else** — another DLNA
+  controller has pushed to it since we let go.
+- **Never while the speaker is on another input.** A soundbar playing through
+  HDMI-ARC looks exactly like an idle one over UPnP, so this is checked with
+  Samsung's WAM `GetFunc`: only `wifi` is ours, and `hdmi`, `bt`, `optical` and
+  the rest mean hands off.
+
+Each idle period gets one attempt, so a method that does not work fails once
+rather than every second, and `power.last_result` in `/status` says why nothing
+happened.
+
+The input check needs the WAM API. A renderer without one cannot be asked, and
+refusing to ever power off would make the feature useless on anything but a
+Samsung — so auto-off goes ahead in that case. If a speaker that *has* been
+answering `GetFunc` stops, that is a fault rather than an absence, and it is
+left alone.
+
+**How it switches off.** UPnP has no power-off action, so the bridge tries
+Samsung's WAM `SetPowerStatus` first and falls back to a command you supply:
+
+```bash
+AUTO_OFF=30 \
+POWER_OFF_COMMAND='curl -fsS -X POST http://plug.local/off' \
+POWER_ON_COMMAND='curl -fsS -X POST http://plug.local/on' ./deploy.sh
+```
+
+Whichever one worked is what gets used to wake the speaker again — a smart plug
+that cut the power leaves nothing on the network to answer WAM. The command runs
+through a shell as the service user (root under systemd, so `$HOME` is not
+available and the unit's `ProtectSystem=full` applies) and can only be set from
+the config file, never over the API. It is never written to the log, since it
+usually carries a token.
+
+Find out what your speaker supports before enabling it:
+
+```bash
+python3 tools/diagnose.py --test-power     # switches it off and on again
+```
+
+Whether HW-* soundbars honour `SetPowerStatus` is unverified — they answer only
+part of the WAM API and ignore the rest outright. **If nothing can wake your
+speaker over the network, `AUTO_OFF` means reaching for the remote**; set
+`POWER_ON_COMMAND` to avoid that, or leave auto-off disabled. If neither route
+works the bridge says so in the log and in `/status`, then stops trying.
 
 ### Bit-perfect mode
 
@@ -200,6 +296,10 @@ curl -s http://<host>:8772/status | python3 -m json.tool
 curl -s -X POST http://<host>:8772/volume/10
 curl -s -X POST http://<host>:8772/mute/on
 curl -s -X POST http://<host>:8772/transport/playpause
+curl -s -X POST http://<host>:8772/power/off
+curl -s http://<host>:8772/settings | python3 -m json.tool
+curl -s -X POST -H 'Content-Type: application/json' \
+     -d '{"AUTO_OFF":"30"}' http://<host>:8772/settings
 ```
 
 `version` is the release (`APP_VERSION` in `config.py`); `revision` is the git
@@ -210,9 +310,20 @@ running there.
 `stream.active` is how many renderers are attached **now**; `stream.connections`
 is a lifetime total.
 
-The API accepts volume, mute and transport commands, and binds all interfaces by
-default since the panel must be reachable. To restrict it, set `STATUS_TOKEN`
-(pass it as `X-Bridge-Token:` or `?token=`) or `STATUS_BIND=127.0.0.1`.
+`power.seconds_until_off` is the auto-off countdown, and is `null` whenever
+there is no countdown to show — disabled, already off, or a session is live.
+`power.last_result` records what the last power action actually did, because a
+power command that quietly failed looks exactly like one that worked.
+
+`/settings` reports each editable option's saved value, the value the process
+is actually running on, and whether the two differ. `POST /settings` refuses
+anything outside that set, and refuses the whole request if any field is
+invalid — a half-saved form is worse than one that declined.
+
+The API accepts volume, mute, transport, power and settings commands, and binds
+all interfaces by default since the panel must be reachable. To restrict it, set
+`STATUS_TOKEN` (pass it as `X-Bridge-Token:` or `?token=`) or
+`STATUS_BIND=127.0.0.1`.
 
 ## How it works
 
@@ -356,8 +467,9 @@ health, then drives the real streaming code:
 
 ```bash
 python3 tools/diagnose.py
-python3 tools/diagnose.py 192.0.2.10   # a specific device
-python3 tools/diagnose.py --no-audio   # skip the audible tone
+python3 tools/diagnose.py 192.0.2.10    # a specific device
+python3 tools/diagnose.py --no-audio    # skip the audible tone
+python3 tools/diagnose.py --test-power  # can it be switched off and back on?
 ```
 
 **Everything reports healthy but you hear nothing.** Check the speaker's own
@@ -392,6 +504,13 @@ sudo systemctl restart airplay-soundbar
 `TRANSITIONING`, and a `HEAD` never followed by a `GET`. On Samsung hardware this
 is a wedged media engine: **unplug it at the wall for 30 seconds.** The remote's
 power button is not enough, because network standby preserves the stuck state.
+
+**The speaker does not come back after `AUTO_OFF`.** Whatever powered it off is
+what has to wake it, so a `POWER_OFF_COMMAND` without a matching
+`POWER_ON_COMMAND` leaves it needing the remote — `/status` says so in
+`power.last_result`. If WAM switched it off but will not switch it on, the
+speaker is not reachable in standby: set both commands, or disable `AUTO_OFF`.
+Confirm which way round yours behaves with `tools/diagnose.py --test-power`.
 
 **Not in the AirPlay menu.** Check the host is advertising and `nqptp` is running —
 AirPlay 2 will not work without it:

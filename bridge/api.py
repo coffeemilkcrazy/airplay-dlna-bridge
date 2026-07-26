@@ -6,10 +6,14 @@ tracking, format probing, metadata and HTTP in one file.
 Routes:
     GET  /               web control panel (always served, see below)
     GET  /status         JSON state
+    GET  /settings       editable settings, their saved and running values
     GET  /artwork        current cover art, if any
     POST /volume/<n>     set volume (clamped to max_volume)
     POST /mute/on|off    mute
     POST /transport/<c>  playpause | play | pause | stop | next | previous
+    POST /power/on|off   power the renderer on or off
+    POST /settings       save settings (JSON body, keyed by env name)
+    POST /restart        restart the service to apply saved settings
 """
 
 from __future__ import annotations
@@ -25,6 +29,10 @@ from dacp import COMMANDS
 from webui import PAGE
 
 log = logging.getLogger("bridge.api")
+
+# The only route with a body is /settings, which carries a handful of short
+# strings. Anything larger is not a settings form.
+MAX_BODY_BYTES = 64 * 1024
 
 
 def make_server(bridge) -> ThreadingHTTPServer:
@@ -52,6 +60,23 @@ def make_server(bridge) -> ThreadingHTTPServer:
             self._send(json.dumps(payload).encode(), "application/json", code,
                        {"Access-Control-Allow-Origin": "*"})
 
+        def _body(self):
+            """The request's JSON object, or None if it is not one.
+
+            Content-Length is bounded before reading: this server is on the
+            LAN, and an unbounded read is a way to make it hold memory.
+            """
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                return None
+            if not 0 < length <= MAX_BODY_BYTES:
+                return None
+            try:
+                return json.loads(self.rfile.read(length).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+
         def _authorised(self) -> bool:
             token = bridge.cfg.status_token
             if not token:
@@ -78,6 +103,9 @@ def make_server(bridge) -> ThreadingHTTPServer:
 
             if route == "/status":
                 return self._json(bridge.snapshot())
+
+            if route == "/settings":
+                return self._json(bridge.settings_snapshot())
 
             if route == "/artwork":
                 data, mime = bridge.metadata.artwork_bytes()
@@ -118,6 +146,32 @@ def make_server(bridge) -> ThreadingHTTPServer:
                     return self._json({"ok": True, "muted": want})
                 except Exception as e:
                     return self._json({"error": str(e)}, 502)
+
+            if route == "/settings":
+                payload = self._body()
+                if not isinstance(payload, dict):
+                    return self._json(
+                        {"ok": False,
+                         "errors": {"": "expected a JSON object"}}, 400)
+                ok, result = bridge.update_settings(payload)
+                return self._json(result, 200 if ok else 400)
+
+            if route == "/restart":
+                ok, detail = bridge.request_restart()
+                return self._json({"ok": ok, "detail": detail},
+                                  200 if ok else 503)
+
+            m = re.fullmatch(r"/power/(on|off)", route)
+            if m:
+                if m.group(1) == "on":
+                    # wait=False: a button press should not hold the request
+                    # open for the whole wake. The next poll shows the result.
+                    ok, detail = bridge.power_on(wait=False)
+                else:
+                    ok, detail = bridge.power_off("requested", manual=True)
+                log.info("power %s: %s", m.group(1), detail)
+                return self._json({"ok": ok, "detail": detail},
+                                  200 if ok else 503)
 
             m = re.fullmatch(r"/transport/(\w+)", route)
             if m:

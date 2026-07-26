@@ -13,8 +13,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bridge"))
 
-from bridge import Bridge, ReengagePolicy   # noqa: E402
+import bridge as bridge_mod                 # noqa: E402
+from bridge import AutoOffPolicy, Bridge, ReengagePolicy   # noqa: E402
 from config import Config                   # noqa: E402
+from soundbar import SoundbarError          # noqa: E402
 
 
 def sine_pcm(frames: int, bits: int, rate: int = 44100, amp: float = 0.25) -> bytes:
@@ -176,6 +178,70 @@ class TestReengagePolicy(unittest.TestCase):
         self.assertEqual(p.attempts, 0)
 
 
+class TestAutoOffPolicy(unittest.TestCase):
+    """Powering the speaker off is the one action here the user cannot undo
+    from the sending device, so the arming rules matter more than the timer."""
+
+    def test_disabled_when_zero(self):
+        p = AutoOffPolicy(0)
+        self.assertFalse(p.enabled)
+        p.session_ended()
+        self.assertFalse(p.should_fire(1e9))
+
+    def test_never_fires_before_a_session(self):
+        """seconds_since_audio is infinite until something plays. Without this
+        rule a restart would power the speaker off underneath whoever is
+        watching television on it."""
+        p = AutoOffPolicy(60)
+        self.assertFalse(p.should_fire(float("inf")))
+        self.assertIsNone(p.seconds_remaining(float("inf")))
+
+    def test_fires_once_the_idle_period_passes(self):
+        p = AutoOffPolicy(60)
+        p.session_ended()
+        self.assertFalse(p.should_fire(59))
+        self.assertTrue(p.should_fire(60))
+
+    def test_only_one_attempt_per_idle_period(self):
+        """A method that does not work must not retry every second."""
+        p = AutoOffPolicy(60)
+        p.session_ended()
+        self.assertTrue(p.should_fire(90))
+        p.record_fired()
+        self.assertFalse(p.should_fire(9000))
+
+    def test_a_new_session_rearms_it(self):
+        p = AutoOffPolicy(60)
+        p.session_ended()
+        p.record_fired()
+        p.session_started()
+        self.assertFalse(p.should_fire(1e9))     # live session, no countdown
+        p.session_ended()
+        self.assertTrue(p.should_fire(60))
+
+    def test_countdown_only_while_armed(self):
+        p = AutoOffPolicy(600)
+        self.assertIsNone(p.seconds_remaining(10))
+        p.session_ended()
+        self.assertEqual(p.seconds_remaining(100), 500)
+        p.record_fired()
+        self.assertIsNone(p.seconds_remaining(100))
+
+    def test_countdown_never_negative(self):
+        p = AutoOffPolicy(60)
+        p.session_ended()
+        self.assertEqual(p.seconds_remaining(999), 0.0)
+
+    def test_disable_is_permanent(self):
+        p = AutoOffPolicy(60)
+        p.session_ended()
+        p.disable("nothing can power this off")
+        self.assertFalse(p.enabled)
+        self.assertFalse(p.should_fire(1e9))
+        p.session_ended()                        # even after another session
+        self.assertFalse(p.should_fire(1e9))
+
+
 class CountingBar(FakeBar):
     """Records how often the soundbar is actually queried."""
 
@@ -241,6 +307,255 @@ class TestStatusCaching(unittest.TestCase):
         self.assertEqual(snap["stream"]["active"], 0)
         self.assertIn("version", snap)
         self.assertIn("revision", snap)
+
+
+class PowerBar(CountingBar):
+    """A renderer that may or may not accept WAM power commands, and may or
+    may not report which input it is on."""
+
+    def __init__(self, wam_works=True, function="wifi"):
+        super().__init__()
+        self.wam_works = wam_works
+        self.function = function        # None means GetFunc does not answer
+        self.power_calls = []
+        self.transport = "STOPPED"
+
+    def wam_power(self, on, timeout=6):
+        self.power_calls.append(on)
+        if not self.wam_works:
+            raise SoundbarError("no answer")
+        return "<UIC/>"
+
+    def wam_function(self):
+        if self.function is None:
+            raise SoundbarError("no answer")
+        return self.function, "dlna"
+
+    def transport_state(self, timeout=8):
+        if self.fail:
+            raise SoundbarError("unreachable")
+        return self.transport
+
+    def is_reachable(self, port=None, timeout=3):
+        return True
+
+
+class TestPowerControl(unittest.TestCase):
+    """WAM first, the configured command second, and whatever worked is what
+    has to undo it."""
+
+    def _bridge(self, **cfg):
+        return Bridge(Config(soundbar_ip="127.0.0.1", **cfg))
+
+    def _fake_commands(self):
+        """Replace the shell runner: the suite must never spawn one."""
+        ran = []
+
+        def runner(command):
+            ran.append(command)
+            return True, "command succeeded"
+
+        original = bridge_mod.run_command
+        bridge_mod.run_command = runner
+        self.addCleanup(setattr, bridge_mod, "run_command", original)
+        return ran
+
+    def test_wam_is_tried_first(self):
+        b = self._bridge()
+        b.bar = PowerBar()
+        ran = self._fake_commands()
+        ok, _ = b.power_off("test")
+        self.assertTrue(ok)
+        self.assertEqual(b.bar.power_calls, [False])
+        self.assertEqual(ran, [])                # command not needed
+        self.assertTrue(b.powered_off)
+
+    def test_falls_back_to_the_command_when_wam_is_silent(self):
+        b = self._bridge(power_off_command="plug off")
+        b.bar = PowerBar(wam_works=False)
+        ran = self._fake_commands()
+        ok, _ = b.power_off("test")
+        self.assertTrue(ok)
+        self.assertEqual(ran, ["plug off"])
+        self.assertTrue(b.powered_off)
+
+    def test_no_method_at_all_disarms_auto_off(self):
+        """Otherwise it fails identically every second for the rest of the
+        night, and the log is useless."""
+        b = self._bridge(auto_off_minutes=30)
+        b.bar = PowerBar(wam_works=False)
+        ok, detail = b.power_off("test")
+        self.assertFalse(ok)
+        self.assertFalse(b.powered_off)
+        self.assertFalse(b.auto_off.enabled)
+        self.assertIn("POWER_OFF_COMMAND", detail)
+
+    def test_wake_uses_wam_when_wam_powered_it_off(self):
+        b = self._bridge()
+        b.bar = PowerBar()
+        b.power_off("test")
+        ok, _ = b.power_on(wait=False)
+        self.assertTrue(ok)
+        self.assertEqual(b.bar.power_calls, [False, True])
+        self.assertFalse(b.powered_off)
+
+    def test_wake_uses_the_command_when_the_command_powered_it_off(self):
+        """A plug that cut the power leaves nothing on the network to answer
+        WAM, so the inverse command is the only thing that can work."""
+        b = self._bridge(power_off_command="plug off",
+                         power_on_command="plug on")
+        b.bar = PowerBar(wam_works=False)
+        ran = self._fake_commands()
+        b.power_off("test")
+        b.power_on(wait=False)
+        self.assertEqual(ran, ["plug off", "plug on"])
+        self.assertNotIn(True, b.bar.power_calls)   # never went near WAM
+
+    def test_command_off_without_a_command_on_is_reported(self):
+        b = self._bridge(power_off_command="plug off")
+        b.bar = PowerBar(wam_works=False)
+        self._fake_commands()
+        b.power_off("test")
+        ok, detail = b.power_on(wait=False)
+        self.assertFalse(ok)
+        self.assertIn("POWER_ON_COMMAND", detail)
+        self.assertTrue(b.powered_off)             # still off, and says so
+
+    def test_failure_is_visible_in_status(self):
+        b = self._bridge()
+        b.bar = PowerBar(wam_works=False)
+        b.power_off("test")
+        self.assertIn("cannot power", b.snapshot()["power"]["last_result"])
+
+    def test_off_is_idempotent(self):
+        b = self._bridge()
+        b.bar = PowerBar()
+        b.power_off("first")
+        b.power_off("second")
+        self.assertEqual(b.bar.power_calls, [False])
+
+    def test_busy_renderer_is_left_alone(self):
+        b = self._bridge()
+        b.bar = PowerBar()
+        b.bar.transport = "PLAYING"
+        self.assertIn("playing", b._renderer_in_use())
+        b.bar.transport = "STOPPED"
+        self.assertEqual(b._renderer_in_use(), "")
+
+    def test_unreachable_renderer_does_not_count_as_in_use(self):
+        b = self._bridge()
+        b.bar = PowerBar(function=None)     # answers nothing at all
+        b.bar.fail = True
+        self.assertEqual(b._renderer_in_use(), "")
+
+
+    def test_manual_off_outranks_a_live_session(self):
+        """The session loop wakes a speaker it powered off. An explicit off
+        from the panel must survive that, or the button does nothing while
+        anything is playing."""
+        b = self._bridge()
+        b.bar = PowerBar()
+        b.power_off("requested", manual=True)
+        self.assertTrue(b._suppress_wake)
+        b.power_on(wait=False)
+        self.assertFalse(b._suppress_wake)
+
+    def test_auto_off_still_allows_the_next_wake(self):
+        b = self._bridge()
+        b.bar = PowerBar()
+        b.power_off("idle for 30 min")
+        self.assertFalse(b._suppress_wake)
+
+
+class TestInputGuard(unittest.TestCase):
+    """A soundbar playing a film through HDMI-ARC looks exactly like an idle
+    one over UPnP. Only the WAM input tells them apart, and switching it off
+    mid-film is the worst thing this feature could do."""
+
+    def _bridge(self, **cfg):
+        return Bridge(Config(soundbar_ip="127.0.0.1", **cfg))
+
+    def test_wifi_input_may_be_powered_off(self):
+        b = self._bridge()
+        b.bar = PowerBar(function="wifi")
+        self.assertEqual(b._renderer_in_use(), "")
+
+    def test_hdmi_input_is_left_alone(self):
+        b = self._bridge()
+        b.bar = PowerBar(function="hdmi")
+        self.assertIn("hdmi", b._renderer_in_use())
+
+    def test_any_other_input_is_left_alone(self):
+        for function in ("bt", "optical", "aux", "soundshare", "HDMI"):
+            b = self._bridge()
+            b.bar = PowerBar(function=function)
+            self.assertNotEqual(b._renderer_in_use(), "", function)
+
+    def test_renderer_without_the_wam_api_still_powers_off(self):
+        """Otherwise auto-off would never work on anything but a Samsung."""
+        b = self._bridge()
+        b.bar = PowerBar(function=None)
+        self.assertEqual(b._renderer_in_use(), "")
+
+    def test_a_speaker_that_stops_answering_is_left_alone(self):
+        """It answered before, so silence is a fault rather than an absence -
+        and guessing wrong means cutting the power to a speaker in use."""
+        b = self._bridge()
+        b.bar = PowerBar(function="wifi")
+        self.assertEqual(b._renderer_in_use(), "")     # teaches it GetFunc works
+        b.bar.function = None
+        self.assertIn("could not be checked", b._renderer_in_use())
+
+    def test_input_is_checked_even_when_upnp_is_unreachable(self):
+        """The two are separate services on separate ports."""
+        b = self._bridge()
+        b.bar = PowerBar(function="hdmi")
+        b.bar.fail = True                              # transport_state raises
+        self.assertIn("hdmi", b._renderer_in_use())
+
+    def test_auto_off_records_why_it_did_not_fire(self):
+        """'Why didn't it turn off?' must be answerable from /status."""
+        b = self._bridge(auto_off_minutes=30)
+        b.bar = PowerBar(function="hdmi")
+        b.auto_off.session_ended()
+        in_use = b._renderer_in_use()
+        b.power_result = f"auto power-off skipped - {in_use}"
+        self.assertIn("hdmi", b.snapshot()["power"]["last_result"])
+
+    def test_a_manual_power_off_ignores_the_input(self):
+        """An explicit press is an instruction, not a guess."""
+        b = self._bridge()
+        b.bar = PowerBar(function="hdmi")
+        ok, _ = b.power_off("requested", manual=True)
+        self.assertTrue(ok)
+        self.assertTrue(b.powered_off)
+
+class TestPowerStatus(unittest.TestCase):
+    def test_powered_off_is_reported_without_querying_the_device(self):
+        """Polling a speaker we switched off stalls every request for the full
+        timeout to learn something already known."""
+        b = Bridge(Config(soundbar_ip="127.0.0.1"))
+        b.bar = CountingBar()
+        b.powered_off = True
+        snap = b.snapshot()
+        self.assertEqual(snap["soundbar"]["state"], "off")
+        self.assertTrue(snap["power"]["off"])
+        self.assertEqual(b.bar.calls, 0)
+
+    def test_countdown_absent_until_a_session_has_ended(self):
+        b = Bridge(Config(soundbar_ip="127.0.0.1", auto_off_minutes=30))
+        b.bar = CountingBar()
+        self.assertIsNone(b.snapshot()["power"]["seconds_until_off"])
+        b.auto_off.session_ended()
+        b.broadcaster.write(b"\x00\x00\x00\x00")
+        remaining = b.snapshot()["power"]["seconds_until_off"]
+        self.assertIsNotNone(remaining)
+        self.assertLessEqual(remaining, 1800)
+
+    def test_auto_off_minutes_exposed_for_the_panel(self):
+        b = Bridge(Config(soundbar_ip="127.0.0.1", auto_off_minutes=30))
+        b.bar = CountingBar()
+        self.assertEqual(b.snapshot()["power"]["auto_off_minutes"], 30.0)
 
 
 def _free_port() -> int:
@@ -314,19 +629,28 @@ class TestStatusApiAuth(unittest.TestCase):
         _, port = self._start(token="s3cret")
         self.assertEqual(self._get(port, "/status?token=s3cret"), 200)
 
-    def test_control_endpoint_also_guarded(self):
+    def _post(self, port, path):
         import urllib.error
         import urllib.request
-        _, port = self._start(token="s3cret")
-        req = urllib.request.Request(f"http://127.0.0.1:{port}/volume/20",
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
                                      data=b"", method="POST")
         try:
             with urllib.request.urlopen(req, timeout=5) as r:
-                code = r.status
+                return r.status
         except urllib.error.HTTPError as e:
             code = e.code
             e.close()
-        self.assertEqual(code, 401)
+            return code
+
+    def test_control_endpoint_also_guarded(self):
+        _, port = self._start(token="s3cret")
+        self.assertEqual(self._post(port, "/volume/20"), 401)
+
+    def test_power_endpoint_also_guarded(self):
+        """Powering the speaker off is the most disruptive thing this API can
+        do, so it must not be the route that forgets the token."""
+        _, port = self._start(token="s3cret")
+        self.assertEqual(self._post(port, "/power/off"), 401)
 
 
 class TestArtworkAndTransport(unittest.TestCase):
@@ -415,6 +739,33 @@ class TestArtworkAndTransport(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("no AirPlay sender", payload["detail"])
 
+    # -- power ---------------------------------------------------------- #
+    def test_power_off_explains_when_nothing_can_do_it(self):
+        import json as _json
+        b, port = self._start()
+        b.bar = PowerBar(wam_works=False)
+        code, _, body = self._req(port, "/power/off", "POST")
+        self.assertEqual(code, 503)
+        payload = _json.loads(body)
+        self.assertFalse(payload["ok"])
+        self.assertIn("POWER_OFF_COMMAND", payload["detail"])
+
+    def test_power_off_then_on(self):
+        import json as _json
+        b, port = self._start()
+        b.bar = PowerBar()
+        self.assertEqual(self._req(port, "/power/off", "POST")[0], 200)
+        self.assertTrue(b.powered_off)
+        body = _json.loads(self._req(port, "/status")[2])
+        self.assertTrue(body["power"]["off"])
+        self.assertEqual(body["soundbar"]["state"], "off")
+        self.assertEqual(self._req(port, "/power/on", "POST")[0], 200)
+        self.assertFalse(b.powered_off)
+
+    def test_unknown_power_command_rejected(self):
+        _, port = self._start()
+        self.assertEqual(self._req(port, "/power/sideways", "POST")[0], 404)
+
     def test_unknown_transport_command_rejected(self):
         import json as _json
         _, port = self._start()
@@ -436,6 +787,193 @@ class TestArtworkAndTransport(unittest.TestCase):
         b.metadata.active_remote = "998877"
         self.assertTrue(
             _json.loads(self._req(port, "/status")[2])["transport"]["available"])
+
+
+class TestSettingsApi(unittest.TestCase):
+    """Saving and applying are deliberately separate: everything is persisted,
+    but only what the session loop re-reads takes effect without a restart."""
+
+    def _start(self, token="", **cfg):
+        port = _free_port()
+        self.dir = tempfile.mkdtemp()
+        b = Bridge(Config(soundbar_ip="127.0.0.1", status_port=port,
+                          status_bind="127.0.0.1", status_token=token,
+                          config_dir=self.dir, **cfg))
+        b.bar = CountingBar()
+        b.create_status_server()
+        threading.Thread(target=b._status_httpd.serve_forever,
+                         daemon=True).start()
+
+        def cleanup():
+            if b._status_httpd:
+                b._status_httpd.shutdown()
+                b._status_httpd.server_close()
+
+        self.addCleanup(cleanup)
+        return b, port
+
+    def _req(self, port, path, method="GET", body=None, token=None):
+        import json as _json
+        import urllib.error
+        import urllib.request
+        data = None
+        if body is not None:
+            data = _json.dumps(body).encode()
+        elif method == "POST":
+            data = b""
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                     data=data, method=method)
+        if body is not None:
+            req.add_header("Content-Type", "application/json")
+        if token:
+            req.add_header("X-Bridge-Token", token)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, _json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            payload = e.read()
+            e.close()
+            return e.code, _json.loads(payload) if payload else {}
+
+    # -- what is on offer ----------------------------------------------- #
+    def test_only_editable_settings_are_listed(self):
+        _, port = self._start()
+        _, body = self._req(port, "/settings")
+        offered = {item["env"] for item in body["settings"]}
+        self.assertIn("AUTO_OFF", offered)
+        for withheld in ("MAX_VOLUME", "MIN_VOLUME", "POWER_OFF_COMMAND",
+                         "STATUS_TOKEN", "STATUS_BIND"):
+            self.assertNotIn(withheld, offered)
+
+    # -- saving ---------------------------------------------------------- #
+    def test_live_setting_applies_without_a_restart(self):
+        b, port = self._start()
+        code, body = self._req(port, "/settings", "POST", {"AUTO_OFF": "30"})
+        self.assertEqual(code, 200)
+        self.assertEqual(body["restart_required"], [])
+        self.assertEqual(b.cfg.auto_off_minutes, 30.0)
+        # The policy holds its own copy of the threshold.
+        self.assertEqual(b.auto_off.seconds, 1800.0)
+
+    def test_restart_setting_is_saved_but_not_applied(self):
+        """The running value must keep telling the truth until the restart."""
+        b, port = self._start()
+        code, body = self._req(port, "/settings", "POST",
+                               {"AIRPLAY_NAME": "Kitchen"})
+        self.assertEqual(code, 200)
+        self.assertEqual(body["restart_required"], ["AIRPLAY_NAME"])
+        self.assertEqual(b.cfg.airplay_name, "Soundbar")
+
+        _, listing = self._req(port, "/settings")
+        item = next(i for i in listing["settings"]
+                    if i["env"] == "AIRPLAY_NAME")
+        self.assertEqual(item["value"], "Kitchen")
+        self.assertEqual(item["running"], "Soundbar")
+        self.assertTrue(item["pending"])
+        self.assertTrue(listing["restart_pending"])
+
+    def test_unchanged_fields_are_not_reported_as_needing_a_restart(self):
+        """The panel posts the whole form, so most of what arrives is already
+        in force. Listing all of it would make 'needs a restart' meaningless."""
+        _, port = self._start()
+        _, body = self._req(port, "/settings", "POST", {
+            "AIRPLAY_NAME": "Kitchen",     # changed
+            "STREAM_PORT": "8770",         # already the running value
+            "ADVERTISE_IP": "",
+        })
+        self.assertEqual(body["restart_required"], ["AIRPLAY_NAME"])
+        self.assertEqual(list(body["applied"]), ["AIRPLAY_NAME"])
+
+    def test_saving_nothing_new_is_a_no_op(self):
+        _, port = self._start()
+        _, body = self._req(port, "/settings", "POST", {"STREAM_PORT": "8770"})
+        self.assertEqual(body["applied"], {})
+        from config import read_env_file
+        self.assertEqual(read_env_file(self.dir), {})
+
+    def test_resaving_a_pending_value_still_asks_for_the_restart(self):
+        """It is saved but not running, so it is still pending."""
+        _, port = self._start()
+        self._req(port, "/settings", "POST", {"AIRPLAY_NAME": "Kitchen"})
+        _, body = self._req(port, "/settings", "POST",
+                            {"AIRPLAY_NAME": "Kitchen"})
+        self.assertEqual(body["restart_required"], ["AIRPLAY_NAME"])
+
+    def test_value_is_persisted_where_the_installer_carries_it_forward(self):
+        _, port = self._start()
+        self._req(port, "/settings", "POST", {"AUTO_OFF": "30"})
+        from config import read_env_file
+        self.assertEqual(read_env_file(self.dir)["AUTO_OFF"], "30")
+
+    def test_saving_survives_a_restart(self):
+        _, port = self._start()
+        self._req(port, "/settings", "POST", {"AIRPLAY_NAME": "Kitchen"})
+        reborn = Config.from_args(["--config-dir", self.dir])
+        self.assertEqual(reborn.airplay_name, "Kitchen")
+
+    # -- refusals -------------------------------------------------------- #
+    def test_uneditable_setting_is_refused(self):
+        b, port = self._start()
+        code, body = self._req(port, "/settings", "POST", {"MAX_VOLUME": "99"})
+        self.assertEqual(code, 400)
+        self.assertIn("MAX_VOLUME", body["errors"])
+        self.assertEqual(b.cfg.max_volume, 12)
+
+    def test_bad_value_names_the_field(self):
+        _, port = self._start()
+        code, body = self._req(port, "/settings", "POST",
+                               {"STREAM_PORT": "99999"})
+        self.assertEqual(code, 400)
+        self.assertIn("STREAM_PORT", body["errors"])
+
+    def test_one_bad_field_saves_nothing(self):
+        b, port = self._start()
+        self._req(port, "/settings", "POST",
+                  {"AUTO_OFF": "30", "IDLE_STOP": "soon"})
+        self.assertEqual(b.cfg.auto_off_minutes, 0.0)
+        from config import read_env_file
+        self.assertEqual(read_env_file(self.dir), {})
+
+    def test_non_object_body_rejected(self):
+        _, port = self._start()
+        self.assertEqual(
+            self._req(port, "/settings", "POST", ["AUTO_OFF"])[0], 400)
+
+    def test_settings_require_the_token_when_set(self):
+        _, port = self._start(token="s3cret")
+        self.assertEqual(self._req(port, "/settings")[0], 401)
+        self.assertEqual(
+            self._req(port, "/settings", "POST", {"AUTO_OFF": "30"})[0], 401)
+        self.assertEqual(self._req(port, "/restart", "POST")[0], 401)
+        self.assertEqual(
+            self._req(port, "/settings", token="s3cret")[0], 200)
+
+
+class TestRestart(unittest.TestCase):
+    def test_restart_exits_for_the_service_manager(self):
+        """Exiting is the restart: systemd is Restart=always and the
+        LaunchAgent is KeepAlive, so both bring the bridge back."""
+        exited = threading.Event()
+        original = bridge_mod.restart_process
+        bridge_mod.restart_process = exited.set
+        self.addCleanup(setattr, bridge_mod, "restart_process", original)
+
+        b = Bridge(Config(soundbar_ip="127.0.0.1"))
+        ok, detail = b.request_restart()
+        self.assertTrue(ok)
+        self.assertIn("restart", detail)
+        self.assertTrue(exited.wait(5), "the process never exited")
+
+    def test_a_failed_shutdown_does_not_block_the_restart(self):
+        exited = threading.Event()
+        original = bridge_mod.restart_process
+        bridge_mod.restart_process = exited.set
+        self.addCleanup(setattr, bridge_mod, "restart_process", original)
+
+        b = Bridge(Config(soundbar_ip="127.0.0.1"))
+        b.stop = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        b.request_restart()
+        self.assertTrue(exited.wait(5), "a shutdown error stopped the restart")
 
 
 class TestWebUi(unittest.TestCase):
