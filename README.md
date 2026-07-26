@@ -505,6 +505,26 @@ sudo systemctl restart airplay-soundbar
 is a wedged media engine: **unplug it at the wall for 30 seconds.** The remote's
 power button is not enough, because network standby preserves the stuck state.
 
+**Saving settings fails with "Read-only file system".** The systemd unit sets
+`ProtectSystem=full`, which mounts `/etc` read-only for the service along with
+`/usr` and `/boot`, so it cannot rewrite `bridge.env`. The unit carries a
+`ReadWritePaths=-/etc/airplay-soundbar` exception for exactly this; a host
+installed before that was added needs one deploy to pick it up:
+
+```bash
+./deploy.sh pi@raspberrypi.local
+```
+
+Without re-deploying, the same thing as a drop-in:
+
+```bash
+sudo systemctl edit airplay-soundbar     # [Service] / ReadWritePaths=-/etc/airplay-soundbar
+sudo systemctl restart airplay-soundbar
+```
+
+The panel greys the form out and names the file when the service cannot write
+it, so this shows up before you fill anything in.
+
 **The speaker does not come back after `AUTO_OFF`.** Whatever powered it off is
 what has to wake it, so a `POWER_OFF_COMMAND` without a matching
 `POWER_ON_COMMAND` leaves it needing the remote — `/status` says so in

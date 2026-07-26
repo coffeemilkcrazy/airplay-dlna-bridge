@@ -26,6 +26,12 @@ ProtectHome=true
 ProtectSystem=full
 PrivateTmp=false
 ReadWritePaths=/tmp
+# 'full' mounts /etc read-only along with /usr and /boot, which stops the web
+# panel saving settings: it persists them by rewriting bridge.env, in here.
+# Narrowed to the bridge's own directory rather than relaxing ProtectSystem.
+# The '-' prefix keeps the service startable if the directory is ever missing;
+# saving then fails with a clear message instead of the unit refusing to start.
+ReadWritePaths=-/etc/airplay-soundbar
 StateDirectory=airplay-soundbar
 
 StandardOutput=journal

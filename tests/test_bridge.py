@@ -845,6 +845,12 @@ class TestSettingsApi(unittest.TestCase):
                          "STATUS_TOKEN", "STATUS_BIND"):
             self.assertNotIn(withheld, offered)
 
+    def test_writability_is_reported_up_front(self):
+        """Under systemd the unit mounts /etc read-only, so the panel needs to
+        know before someone fills the form in."""
+        _, port = self._start()
+        self.assertTrue(self._req(port, "/settings")[1]["writable"])
+
     # -- saving ---------------------------------------------------------- #
     def test_live_setting_applies_without_a_restart(self):
         b, port = self._start()

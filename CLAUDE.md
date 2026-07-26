@@ -99,6 +99,14 @@ implying a change took effect. Settings persist by writing `bridge.env`, the sam
 file `install.sh` carries forward — so a panel edit survives a re-deploy, while an
 explicit `VAR=x ./deploy.sh` still wins.
 
+**The service sandbox and the config write path are coupled.** The systemd unit
+sets `ProtectSystem=full`, which mounts `/etc` read-only, so writing `bridge.env`
+only works because the unit also carries
+`ReadWritePaths=-/etc/airplay-soundbar`. Anything that changes where config is
+written (`CONFIG_DIR`) needs a matching entry, or every save fails with `EROFS`
+having looked fine all the way to the last step. `/settings` reports `writable`
+so the panel can grey the form out instead.
+
 **The audio format contract spans three files.** `RATE/CHANNELS/BITS` in
 `bridge.py`, the WAV header in `streamer.py`, and the `stdout` stanza
 `install.sh` generates must agree. Under AirPlay 2 shairport-sync's stdout

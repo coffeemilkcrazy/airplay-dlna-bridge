@@ -529,10 +529,17 @@ PAGE = """<!doctype html>
     $("setrestart").classList.toggle("hide", !offerRestart);
   }
 
-  function buildSettings(items) {
+  function buildSettings(items, writable, path) {
     var form = $("setform");
     form.replaceChildren();
     fields = {};
+    // Read-only is a property of the host, not of anything typed here, so say
+    // it before the form is filled in rather than after Save fails.
+    $("setsave").disabled = writable === false;
+    if (writable === false) {
+      setNote("Read-only: the service cannot write " + (path || "its config") +
+              ". See the auto power-off notes in the README.", true);
+    }
     items.forEach(function (item) {
       var wrap = document.createElement("div");
       wrap.className = "field";
@@ -545,6 +552,7 @@ PAGE = """<!doctype html>
       input.type = item.kind === "str" ? "text" : "number";
       if (input.type === "number") input.step = item.kind === "int" ? "1" : "any";
       input.value = item.value;
+      input.disabled = writable === false;
 
       var why = document.createElement("div");
       why.className = "why";
@@ -569,7 +577,7 @@ PAGE = """<!doctype html>
       .then(function (r) { return r.ok ? r.json() : null; })
       .catch(function () { return null; })
       .then(function (d) {
-        if (d && d.settings) buildSettings(d.settings);
+        if (d && d.settings) buildSettings(d.settings, d.writable, d.config_file);
         else setNote("Could not read the settings.", true);
       });
   }

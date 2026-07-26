@@ -10,8 +10,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bridge"))
 
 from config import (APP_VERSION, BY_NAME, Config, EDITABLE,  # noqa: E402
-                    SETTINGS, apply_settings, describe_editable, env_names,
-                    read_env_file, write_env_file)
+                    SETTINGS, apply_settings, config_writable,
+                    describe_editable, env_names, read_env_file,
+                    write_env_file)
 
 
 class TestSettingsTable(unittest.TestCase):
@@ -232,6 +233,23 @@ class TestEnvFile(unittest.TestCase):
         ok, detail = write_env_file("/proc/nope/nowhere", {"AUTO_OFF": "1"})
         self.assertFalse(ok)
         self.assertIn("could not write", detail)
+
+    def test_read_only_filesystem_names_the_service_sandbox(self):
+        """The systemd unit sets ProtectSystem=full, which mounts /etc
+        read-only. Being told the disk is read-only on a machine whose disk
+        plainly is not is a baffling place to be left."""
+        import errno
+        import unittest.mock as mock
+        with mock.patch("builtins.open",
+                        side_effect=OSError(errno.EROFS, "Read-only file system")):
+            ok, detail = write_env_file(self.dir, {"AUTO_OFF": "1"})
+        self.assertFalse(ok)
+        self.assertIn("ProtectSystem", detail)
+        self.assertIn("ReadWritePaths", detail)
+
+    def test_writability_is_reported(self):
+        self.assertTrue(config_writable(self.dir))
+        self.assertFalse(config_writable("/proc/nope/nowhere"))
 
     def test_file_wins_over_the_environment(self):
         """macOS gets its environment from a plist only install.sh rewrites,

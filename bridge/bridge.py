@@ -45,8 +45,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import api                                                   # noqa: E402
 from config import (APP_VERSION, BY_ENV, Config,             # noqa: E402
-                    apply_settings, describe_editable, env_text,
-                    read_env_file, write_env_file)
+                    apply_settings, config_writable,
+                    describe_editable, env_text, read_env_file,
+                    write_env_file)
 from dacp import DacpRemote                                  # noqa: E402
 from metadata import MetadataReader                          # noqa: E402
 from soundbar import Soundbar, SoundbarError                 # noqa: E402
@@ -842,6 +843,9 @@ class Bridge:
                                   read_env_file(self.cfg.config_dir))
         return {"settings": items,
                 "restart_pending": any(i["pending"] for i in items),
+                # Reported up front so the panel can say the form is read-only
+                # rather than letting someone fill it in and hit a wall.
+                "writable": config_writable(self.cfg.config_dir),
                 "config_file": os.path.join(self.cfg.config_dir, "bridge.env")}
 
     def update_settings(self, changes: dict) -> tuple[bool, dict]:

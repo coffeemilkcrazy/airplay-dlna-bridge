@@ -292,6 +292,8 @@ function respondWith(data) {
         value: 30, running: 30, kind: 'float', live: true, pending: false },
     ],
     restart_pending: true,
+    writable: true,
+    config_file: '/etc/airplay-soundbar/bridge.env',
   };
   setResponder(p => ({
     ok: true, status: 200,
@@ -347,6 +349,32 @@ function respondWith(data) {
   await flush(); await flush();
   check('restart requested on demand',
         calls.some(c => String(c.path) === '/restart'));
+
+  // A host that cannot save must say so before the form is filled in, not
+  // after Save fails - this is a property of the host, not of the input.
+  const READONLY = Object.assign({}, SETTINGS, {
+    writable: false, config_file: '/etc/airplay-soundbar/bridge.env',
+  });
+  setResponder(p => ({
+    ok: true, status: 200,
+    json: async () => (String(p).indexOf('/settings') === 0 ? READONLY : payload()),
+  }));
+  els.setwrap.fire('toggle', els.setwrap);
+  await flush(); await flush();
+  check('read-only host disables saving', els.setsave.disabled === true);
+  check('read-only host disables the fields',
+        settingInputs().every(e => e.disabled === true));
+  check('read-only host names the file it cannot write',
+        /bridge\.env/.test(els.setnote.textContent));
+
+  // ...and a writable one leaves the form usable.
+  setResponder(p => ({
+    ok: true, status: 200,
+    json: async () => (String(p).indexOf('/settings') === 0 ? SETTINGS : payload()),
+  }));
+  els.setwrap.fire('toggle', els.setwrap);
+  await flush(); await flush();
+  check('writable host leaves saving enabled', els.setsave.disabled === false);
 
   // A rejected value must name the field rather than failing vaguely.
   setResponder((p, opts) => ({

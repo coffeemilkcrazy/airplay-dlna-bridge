@@ -160,6 +160,14 @@ class TestPanelBehaviour(unittest.TestCase):
         self.assertBehaviour("restart not requested until asked")
         self.assertBehaviour("restart requested on demand")
 
+    def test_read_only_host_is_stated_before_the_form_is_filled_in(self):
+        """Under systemd the unit mounts /etc read-only, so without the
+        ReadWritePaths exception every save fails at the last step."""
+        self.assertBehaviour("read-only host disables saving")
+        self.assertBehaviour("read-only host disables the fields")
+        self.assertBehaviour("read-only host names the file it cannot write")
+        self.assertBehaviour("writable host leaves saving enabled")
+
     def test_rejected_value_is_explained(self):
         self.assertBehaviour("rejected value names the field")
         self.assertBehaviour("rejected value gives the reason")

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import errno
 import logging
 import os
 import sys
@@ -149,6 +150,17 @@ def read_env_file(config_dir: str) -> dict[str, str]:
     return values
 
 
+def config_writable(config_dir: str) -> bool:
+    """Can settings actually be saved here?
+
+    Worth knowing before someone fills the form in: under systemd the unit sets
+    ProtectSystem=full, which mounts /etc read-only along with /usr and /boot,
+    so without a ReadWritePaths exception every save fails at the last step
+    having looked fine all the way to it.
+    """
+    return os.access(config_dir, os.W_OK)
+
+
 def write_env_file(config_dir: str, updates: dict[str, str]) -> tuple[bool, str]:
     """Merge `updates` into bridge.env, leaving every other value alone.
 
@@ -175,7 +187,15 @@ def write_env_file(config_dir: str, updates: dict[str, str]) -> tuple[bool, str]
             os.unlink(tmp)
         except OSError:
             pass
-        return False, f"could not write {path}: {e}"
+        detail = f"could not write {path}: {e}"
+        if e.errno == errno.EROFS:
+            # Almost always the service sandbox rather than the disk: say so,
+            # because "read-only file system" on a machine whose disk is
+            # plainly writable is a baffling thing to be told.
+            detail += (" - the service unit mounts this read-only "
+                       "(ProtectSystem=full); its ReadWritePaths must cover "
+                       "this directory")
+        return False, detail
     return True, path
 
 
