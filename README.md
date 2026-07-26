@@ -1,6 +1,8 @@
 # airplay-dlna-bridge
 
-[![CI](https://github.com/coffeemilkcrazy/airplay-dlna-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/coffeemilkcrazy/airplay-dlna-bridge/actions/workflows/ci.yml)
+[![CI](https://github.com/coffeemilkcrazy/airplay-dlna-bridge/actions/workflows/run_tests.yml/badge.svg)](https://github.com/coffeemilkcrazy/airplay-dlna-bridge/actions/workflows/run_tests.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-orange)](LICENSE)
 
 Give an **AirPlay 2 receiver** to any speaker that only speaks UPnP/DLNA.
 
