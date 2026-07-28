@@ -12,6 +12,7 @@ Routes:
     POST /mute/on|off    mute
     POST /transport/<c>  playpause | play | pause | stop | next | previous
     POST /power/on|off   power the renderer on or off
+    POST /test-tone      play a test tone down the real audio path
     POST /settings       save settings (JSON body, keyed by env name)
     POST /restart        restart the service to apply saved settings
 """
@@ -172,6 +173,13 @@ def make_server(bridge) -> ThreadingHTTPServer:
                 log.info("power %s: %s", m.group(1), detail)
                 return self._json({"ok": ok, "detail": detail},
                                   200 if ok else 503)
+
+            if route == "/test-tone":
+                # Holds the request for the length of the tone: the caller
+                # wants the verdict, and it is only worth anything once the
+                # audio has actually been through the chain.
+                ok, verdict = bridge.play_test_tone()
+                return self._json({"ok": ok, **verdict}, 200 if ok else 503)
 
             m = re.fullmatch(r"/transport/(\w+)", route)
             if m:

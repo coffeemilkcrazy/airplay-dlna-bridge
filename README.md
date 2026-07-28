@@ -128,7 +128,8 @@ Open **`http://<host>:8772/`** from any device on the network.
 - **Play / pause / skip**, plus a volume slider and mute
 - **Turn the speaker off**, and the auto-off countdown when one is armed
 - Live state: AirPlay session, attached renderers, audio sent, version
-- A **Settings** panel for the everyday options, saved on the host
+- A **Settings** panel for the everyday options, saved on the host, with
+  **Test speaker** and **Restart** buttons
 - Refreshes every 2s, and says plainly when the bridge or speaker is unreachable
 
 Self-contained: no CDN, no build step, no internet access needed on the host. It
@@ -150,15 +151,42 @@ the installer still wins.
 
 <p align="center">
   <img src="docs/web-panel-settings.png" alt="The settings panel: one field per
-  editable option, each with its help text and a Save button"
+  editable option, each with its help text, above Save, Test speaker and
+  Restart buttons"
   width="420">
 </p>
 
 `IDLE_STOP` and `AUTO_OFF` take effect at once. The rest are read at startup, so
-saving them offers a **Restart now** button; until you take it, the field says
+saving them highlights the **Restart** button; until you take it, the field says
 what is saved *and* what is still running, rather than implying the change is
 live. Restarting exits the process and lets systemd or launchd start it again,
-which drops any AirPlay session in progress.
+which drops any AirPlay session in progress — so the button takes **two taps**,
+the first of which asks you to confirm.
+
+### Test speaker
+
+**Test speaker** plays a two-second 440 Hz tone and tells you what happened.
+
+The tone is not a shortcut: it is generated in the bridge's own format, fed
+through the same `PcmBroadcaster` and WAV server that carry AirPlay audio, and
+paced in real time exactly as live audio arrives. Hearing it means the whole
+chain works. That matters because a renderer will happily accept
+`SetAVTransportURI`, answer `Play`, report `PLAYING`, and emit nothing — which
+is the single most confusing way this can fail.
+
+So the verdict names the likely cause rather than only reporting numbers:
+
+| What comes back | What it means |
+|---|---|
+| tone sent to *n* renderers | audio reached the speaker; if it was silent, check its input |
+| no renderer fetched the stream | the speaker never opened the URL — check `ADVERTISE_IP` and that `STREAM_PORT` is reachable |
+| the speaker is muted / its volume is 0 | exactly that, read back from the device |
+| an AirPlay session is playing | both feed the same broadcaster, so a tone would interleave with the music into noise. Stop playback and try again |
+
+It wakes a speaker the bridge switched off, and engages the renderer first if
+nothing is currently attached. While it plays, `/status` reports
+`test_tone.playing` rather than an AirPlay session — the tone moves the same
+liveness signal, and calling it a session would be a small lie.
 
 Deliberately **not** editable here, each for its own reason:
 
@@ -297,6 +325,7 @@ curl -s -X POST http://<host>:8772/volume/10
 curl -s -X POST http://<host>:8772/mute/on
 curl -s -X POST http://<host>:8772/transport/playpause
 curl -s -X POST http://<host>:8772/power/off
+curl -s -X POST http://<host>:8772/test-tone      # holds ~2s, returns a verdict
 curl -s http://<host>:8772/settings | python3 -m json.tool
 curl -s -X POST -H 'Content-Type: application/json' \
      -d '{"AUTO_OFF":"30"}' http://<host>:8772/settings
@@ -314,6 +343,13 @@ is a lifetime total.
 there is no countdown to show — disabled, already off, or a session is live.
 `power.last_result` records what the last power action actually did, because a
 power command that quietly failed looks exactly like one that worked.
+
+`POST /test-tone` plays the tone described above and holds the request until it
+has finished, because the verdict is only worth anything once the audio has been
+through the chain. It returns `detail` (what to check), plus `renderers`,
+`bytes_sent`, `volume`, `muted` and `state`. `test_tone.playing` in `/status`
+distinguishes a tone from a real session; `test_tone.last_result` keeps the last
+verdict.
 
 `/settings` reports each editable option's saved value, the value the process
 is actually running on, and whether the two differ. `POST /settings` refuses
@@ -472,9 +508,15 @@ python3 tools/diagnose.py --no-audio    # skip the audible tone
 python3 tools/diagnose.py --test-power  # can it be switched off and back on?
 ```
 
-**Everything reports healthy but you hear nothing.** Check the speaker's own
-volume — it is separate from the sender's AirPlay slider, and anything under ~10
-of 100 is effectively silent. Measure the stream rather than guessing; a healthy
+**Everything reports healthy but you hear nothing.** Press **Test speaker** in
+the panel (or `curl -s -X POST http://<host>:8772/test-tone`). It plays a tone
+down the real audio path and names the likely cause — no renderer fetched the
+stream, muted, volume 0, or a speaker that took the audio and is on another
+input. That answers in one press what otherwise takes a live capture.
+
+If you want the underlying numbers, check the speaker's own volume — it is
+separate from the sender's AirPlay slider, and anything under ~10 of 100 is
+effectively silent — and measure the stream rather than guessing; a healthy
 signal is around −20 dBFS RMS:
 
 ```bash

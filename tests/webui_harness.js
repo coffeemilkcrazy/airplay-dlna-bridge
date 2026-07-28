@@ -58,8 +58,8 @@ const IDS = ['dot', 'devname', 'ver', 'build', 'banner', 'title', 'sub', 'art',
              'state', 'elapsed', 'vol', 'volval', 'volmax', 'mute', 'up',
              'down', 'session', 'active', 'bytes', 'ip', 'foot', 'eq',
              'prev', 'playpause', 'next', 'power', 'autooff',
-             'setwrap', 'setform', 'setsave', 'setnote', 'setrestart',
-             'dorestart'];
+             'setwrap', 'setform', 'setsave', 'setnote', 'setactions',
+             'dorestart', 'settest'];
 IDS.forEach(id => { els[id] = makeEl(id); });
 
 // The settings form is generated from /settings, so the stub has to be able to
@@ -142,6 +142,7 @@ function payload(over = {}) {
                 volume: 7, muted: false, elapsed: '0:01:00', max_volume: 12 },
     power: { auto_off_minutes: 30, off: false, seconds_until_off: null,
              last_result: '' },
+    test_tone: { playing: false, last_result: '' },
     stream: { url: '', connections: 1, active: 1, bytes: 1048576 },
     last_error: '',
   };
@@ -340,15 +341,80 @@ function respondWith(data) {
      ['AIRPLAY_NAME', 'AUTO_OFF']);
   check('save reports what needs a restart',
         /restart/i.test(els.setnote.textContent));
+  // The button is always present, so "offered" is a highlight rather than an
+  // appearance - a control that materialises shifts the layout under a thumb.
   check('restart offered, not performed',
-        !els.setrestart.classList.contains('hide'));
+        els.dorestart.classList.contains('on'));
   check('restart not requested until asked',
         !calls.some(c => String(c.path) === '/restart'));
+
+  // Two taps: restarting drops a live session, and the panel is unauthenticated
+  // on the LAN by default, so one stray tap must not cost someone their music.
+  els.dorestart.fire('click', els.dorestart);
+  await flush(); await flush();
+  check('first tap arms rather than restarting',
+        !calls.some(c => String(c.path) === '/restart'));
+  check('armed restart says a second tap is needed',
+        /confirm/i.test(els.dorestart.textContent));
 
   els.dorestart.fire('click', els.dorestart);
   await flush(); await flush();
   check('restart requested on demand',
         calls.some(c => String(c.path) === '/restart'));
+  check('restart button returns to its resting label',
+        els.dorestart.textContent === 'Restart');
+
+  // ---- test speaker ------------------------------------------------------
+  // The tone is played by the bridge, down the real audio path; the panel's
+  // job is to report the verdict it gets back rather than to invent one.
+  calls.length = 0;
+  setResponder((p, opts) => ({
+    ok: true, status: 200,
+    json: async () => (String(p) === '/test-tone' && opts && opts.method === 'POST'
+      ? { ok: true, renderers: 1, bytes_sent: 352800, volume: 7, muted: false,
+          detail: 'tone sent to 1 renderer - if you heard nothing, check the '
+                  + 'speaker is on its network input' }
+      : payload()),
+  }));
+  els.settest.fire('click', els.settest);
+  check('test speaker disabled while the tone plays',
+        els.settest.disabled === true);
+  check('test speaker says it is running', /Testing/.test(els.settest.textContent));
+  await flush(); await flush(); await flush();
+
+  check('test tone POSTed',
+        calls.some(c => String(c.path) === '/test-tone'
+                        && c.opts && c.opts.method === 'POST'));
+  check('test speaker re-enabled afterwards', els.settest.disabled === false);
+  check('test speaker returns to its resting label',
+        els.settest.textContent === 'Test speaker');
+  check('verdict reported from the bridge',
+        /network input/.test(els.setnote.textContent));
+
+  // A refused test must read as a fault rather than as a clean result.
+  setResponder((p, opts) => ({
+    ok: false, status: 503,
+    json: async () => (String(p) === '/test-tone' && opts && opts.method === 'POST'
+      ? { ok: false, renderers: 0, bytes_sent: 0,
+          detail: 'an AirPlay session is playing - stop it and try again' }
+      : payload()),
+  }));
+  els.settest.fire('click', els.settest);
+  await flush(); await flush(); await flush();
+  check('refused test explains why',
+        /AirPlay session is playing/.test(els.setnote.textContent));
+  check('refused test marked as a fault', els.setnote.classList.contains('bad'));
+
+  // A tone moves seconds_since_audio exactly as AirPlay audio does, so the
+  // panel must name it rather than report a session that does not exist.
+  respondWith(payload({
+    now_playing: { title: '', artist: '', album: '' },
+    test_tone: { playing: true, last_result: '' },
+  }));
+  document._fire('visibilitychange');
+  await flush(); await flush();
+  eq('test tone named, not reported as a session',
+     els.title.textContent, 'Test tone');
 
   // A host that cannot save must say so before the form is filled in, not
   // after Save fails - this is a property of the host, not of the input.

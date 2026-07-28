@@ -20,9 +20,12 @@ session between tracks and re-buffers audibly on the next one.
 
 from __future__ import annotations
 
+import array
 import logging
+import math
 import socket
 import struct
+import sys
 import threading
 import time
 
@@ -43,6 +46,11 @@ MAX_DROP_SECONDS = 5.0
 # MAX_TRIM_SECONDS per correction so no single splice becomes audible.
 TRIM_DIVISOR = 32
 MAX_TRIM_SECONDS = 0.01
+
+# Test-tone edges. A sine that starts and stops at full amplitude steps the DAC
+# discontinuously, and every speaker renders that as a click - which is exactly
+# what someone testing a silent speaker would hear and take for success.
+FADE_SECONDS = 0.015
 
 # NOTE: this is drift *mitigation*, not resampling. A true fix would resample
 # the stream by a continuously adjusted ratio (~1 +/- 1e-4) so no samples are
@@ -122,6 +130,43 @@ class PcmBroadcaster:
 
     def silence(self, seconds: float) -> bytes:
         return b"\x00" * (int(self.bytes_per_second * seconds) & ~3)
+
+    def tone(self, seconds: float, freq: float = 440.0,
+             amplitude: float = 0.25) -> bytes:
+        """A fixed-frequency test tone in this broadcaster's own format.
+
+        Generated here rather than shipped as an asset so it always matches
+        whatever rate/channel count the broadcaster is running at - a tone that
+        disagreed with the WAV header would itself sound wrong, and diagnosing
+        the diagnostic is the last thing anyone needs.
+
+        Faded in and out over FADE_SECONDS; see the constant for why.
+
+        16-bit only, like the rest of the audio path: the WAV header,
+        RATE/CHANNELS/BITS in bridge.py and shairport-sync's `stdout` stanza
+        all agree on S16_LE, and this has to agree with them too.
+        """
+        if self.bits != 16:
+            raise ValueError(f"test tone needs 16-bit output, not {self.bits}")
+        frames = max(0, int(self.rate * seconds))
+        # Halve the fade rather than overlap the two on a very short tone,
+        # which would leave the envelope never reaching full amplitude.
+        fade = min(int(self.rate * FADE_SECONDS), frames // 2)
+        samples = array.array("h")
+        for i in range(frames):
+            gain = amplitude
+            if i < fade:
+                gain *= 0.5 - 0.5 * math.cos(math.pi * i / fade)
+            elif i >= frames - fade:
+                gain *= 0.5 - 0.5 * math.cos(math.pi * (frames - 1 - i) / fade)
+            value = int(gain * 32767
+                        * math.sin(2 * math.pi * freq * i / self.rate))
+            for _ in range(self.channels):
+                samples.append(value)
+        # array is native-endian; the WAV header declares little-endian.
+        if sys.byteorder != "little":
+            samples.byteswap()
+        return samples.tobytes()
 
 
 class _Client:

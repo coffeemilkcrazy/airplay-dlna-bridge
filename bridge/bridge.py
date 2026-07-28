@@ -77,6 +77,15 @@ RESTART_DELAY = 0.4
 # the speaker for something this bridge cannot see.
 NETWORK_INPUT = "wifi"
 
+# Test tone: long enough to be unmistakable, short enough not to be a nuisance.
+TEST_TONE_SECONDS = 2.0
+TEST_TONE_HZ = 440.0
+# ~-12 dBFS peak: clearly audible on a speaker at a normal setting, without
+# being alarming on one that someone has turned up.
+TEST_TONE_AMPLITUDE = 0.25
+# How long a renderer gets to fetch the stream before we play into nothing.
+TEST_TONE_CLIENT_WAIT = 4.0
+
 
 def restart_process() -> None:
     """Exit so the service manager starts us again.
@@ -238,6 +247,9 @@ class Bridge:
         self._off_method = ""        # "wam" | "command"; its inverse wakes it
         self._suppress_wake = False  # an explicit off outranks a live session
         self._input_readable = False  # has this renderer ever reported its input
+        self.test_tone_playing = False
+        self.test_tone_result = ""   # last tone verdict, surfaced in /status
+        self._tone_lock = threading.Lock()
 
         self._stop = threading.Event()
         self._proc: subprocess.Popen | None = None
@@ -541,6 +553,127 @@ class Bridge:
         if self.server:
             self.server.disconnect_clients()
 
+    # -- test tone -------------------------------------------------------- #
+    def play_test_tone(self) -> tuple[bool, dict]:
+        """Play a tone down the real audio path and report what happened.
+
+        Deliberately not a synthetic check. The tone goes through
+        PcmBroadcaster and LiveWavServer exactly as AirPlay audio does, so
+        hearing it means the whole chain works - whereas a renderer that
+        answers control commands perfectly well while emitting nothing is the
+        failure this exists to catch.
+
+        The verdict names the likely fault rather than only reporting numbers.
+        "No sound" is the symptom this shortens, and `renderers: 0` means
+        nothing to someone who is not holding the source open.
+        """
+        if not self._tone_lock.acquire(blocking=False):
+            return False, self._tone_verdict("a test tone is already playing")
+        try:
+            # Both feed the same broadcaster, so a tone played during a session
+            # interleaves with the music and arrives as noise - which is
+            # indistinguishable from the fault being tested for.
+            if self.broadcaster.seconds_since_audio < self.cfg.idle_stop_seconds:
+                return False, self._tone_verdict(
+                    "an AirPlay session is playing - stop it and try again")
+            if not self.bar:
+                return False, self._tone_verdict("no renderer is configured")
+            if not self.server:
+                return False, self._tone_verdict("the audio stream is not running")
+
+            if self.powered_off:
+                ok, detail = self.power_on()
+                if not ok:
+                    return False, self._tone_verdict(
+                        f"could not wake the speaker: {detail}")
+
+            # Engage only when nothing is listening: the session loop may have
+            # done it already, and a second SetAVTransportURI would restart the
+            # renderer's fetch underneath the tone.
+            if self.broadcaster.client_count == 0 and not self._engage_soundbar():
+                return False, self._tone_verdict(
+                    f"could not engage the renderer: {self.last_error}")
+
+            attached = self._await_stream_client()
+            before = self.server.bytes_streamed if self.server else 0
+            self.test_tone_playing = True
+            try:
+                self._write_paced(self.broadcaster.tone(
+                    TEST_TONE_SECONDS, TEST_TONE_HZ, TEST_TONE_AMPLITUDE))
+            finally:
+                self.test_tone_playing = False
+            sent = (self.server.bytes_streamed if self.server else 0) - before
+
+            # Read the speaker once, after the tone, and use that one reading
+            # for both the explanation and the numbers - so they cannot
+            # disagree with each other.
+            self.invalidate_soundbar_cache()
+            bar = self._soundbar_state()
+            return True, self._tone_verdict(
+                self._tone_detail(attached, bar), sent=sent, bar=bar)
+        finally:
+            self._tone_lock.release()
+
+    def _await_stream_client(self) -> bool:
+        """Wait for a renderer to actually fetch the stream.
+
+        Engaging only tells the renderer where the audio is; it then opens its
+        own HTTP connection, which takes a moment. A two-second tone played
+        before that lands nowhere and would read as a fault.
+        """
+        deadline = time.monotonic() + TEST_TONE_CLIENT_WAIT
+        while time.monotonic() < deadline and not self._stop.is_set():
+            if self.broadcaster.client_count:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _write_paced(self, pcm: bytes) -> None:
+        """Feed PCM to the broadcaster at the rate it would arrive live.
+
+        Writing it in one go would overshoot _Client's backlog - two seconds,
+        which a two-second tone reaches exactly - and the trim and drop paths
+        would shed most of it. Pacing makes the tone travel as AirPlay audio
+        does, which is the entire point of testing this way.
+        """
+        rate = self.broadcaster.bytes_per_second
+        start = time.monotonic()
+        for offset in range(0, len(pcm), CHUNK):
+            self.broadcaster.write(pcm[offset:offset + CHUNK])
+            ahead = start + (offset + CHUNK) / rate - time.monotonic()
+            if ahead > 0:
+                time.sleep(ahead)
+
+    def _tone_detail(self, attached: bool, bar: dict) -> str:
+        """Name the likeliest reason a tone that was sent was not heard."""
+        count = self.broadcaster.client_count
+        if not attached or not count:
+            return ("tone sent, but no renderer fetched the stream - check "
+                    f"the speaker can reach {self.cfg.advertise_ip} on port "
+                    f"{self.cfg.stream_port}")
+        where = f"{count} renderer" + ("s" if count > 1 else "")
+        if bar["muted"]:
+            return f"tone sent to {where}, but the speaker is muted"
+        if bar["volume"] == 0:
+            return f"tone sent to {where}, but its volume is 0"
+        return (f"tone sent to {where} - if you heard nothing, check the "
+                "speaker is on its network input")
+
+    def _tone_verdict(self, detail: str, sent: int = 0,
+                      bar: dict | None = None) -> dict:
+        bar = self._soundbar_state() if bar is None else bar
+        self.test_tone_result = detail
+        log.info("test tone: %s", detail)
+        return {
+            "detail": detail,
+            "renderers": self.broadcaster.client_count,
+            "bytes_sent": sent,
+            "seconds": TEST_TONE_SECONDS,
+            "volume": bar["volume"],
+            "muted": bar["muted"],
+            "state": bar["state"],
+        }
+
     # -- audio ----------------------------------------------------------- #
     def _run_shairport(self) -> None:
         exe = shutil.which(self.cfg.shairport_bin)
@@ -705,7 +838,12 @@ class Bridge:
             if want and self.powered_off and not self._suppress_wake:
                 self.power_on()
 
-            if want and not engaged and policy.may_engage():
+            # A test tone moves the same liveness signal as AirPlay audio, so
+            # without this the loop would engage a second time in the middle of
+            # one - and a renderer told to fetch the URI again restarts the
+            # stream, cutting the tone off. play_test_tone has already engaged.
+            if want and not engaged and policy.may_engage() \
+                    and not self.test_tone_playing:
                 engaged = self._engage_soundbar()
                 policy.record_engage()
                 last_check = time.monotonic()
@@ -825,6 +963,13 @@ class Bridge:
                 "seconds_until_off": self.auto_off.seconds_remaining(
                     self.broadcaster.seconds_since_audio),
                 "last_result": self.power_result,
+            },
+            # Audio from a test tone moves seconds_since_audio exactly as
+            # AirPlay audio does, so session_active goes true for one. Say
+            # which it is rather than letting the panel imply a session.
+            "test_tone": {
+                "playing": self.test_tone_playing,
+                "last_result": self.test_tone_result,
             },
             "stream": {
                 "url": self._stream_url() if self.server else "",

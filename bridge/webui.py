@@ -235,8 +235,9 @@ PAGE = """<!doctype html>
       <button id="setsave">Save</button>
     </div>
     <div class="note hide" id="setnote"></div>
-    <div class="btns hide" id="setrestart">
-      <button id="dorestart">Restart now</button>
+    <div class="btns" id="setactions">
+      <button id="settest">Test speaker</button>
+      <button id="dorestart">Restart</button>
     </div>
   </details>
 
@@ -306,6 +307,7 @@ PAGE = """<!doctype html>
   function render(d) {
     var bar = d.soundbar || {}, np = d.now_playing || {}, st = d.stream || {};
     var art = d.artwork || {}, tr = d.transport || {}, pw = d.power || {};
+    var tone = d.test_tone || {};
 
     $("devname").textContent = d.airplay_name || "Soundbar";
     // Release version in the header; the git revision goes in the detail list
@@ -320,7 +322,12 @@ PAGE = """<!doctype html>
 
     var title = (np.title || "").trim(), artist = (np.artist || "").trim(),
         album = (np.album || "").trim();
-    if (title || artist) {
+    // A tone drives session_active exactly as AirPlay audio does, so it is
+    // checked first: calling it a session would be the panel's own small lie.
+    if (tone.playing) {
+      $("title").textContent = "Test tone";
+      $("sub").textContent = "";
+    } else if (title || artist) {
       $("title").textContent = title || "(unknown title)";
       $("sub").textContent = [artist, album].filter(Boolean).join(" \\u2014 ");
     } else {
@@ -526,7 +533,10 @@ PAGE = """<!doctype html>
     note.textContent = text;
     note.classList.toggle("bad", !!bad);
     note.classList.remove("hide");
-    $("setrestart").classList.toggle("hide", !offerRestart);
+    // Restart is always available, so a save that needs one highlights the
+    // button rather than making one appear - a control that materialises
+    // shifts everything below it out from under a thumb already on its way.
+    $("dorestart").classList.toggle("on", !!offerRestart);
   }
 
   function buildSettings(items, writable, path) {
@@ -612,12 +622,53 @@ PAGE = """<!doctype html>
   });
   $("setsave").addEventListener("click", saveSettings);
 
+  // Restarting drops a live AirPlay session mid-track, and the panel binds
+  // every interface with no token by default - so the button is always here,
+  // but it takes two taps, and the first one says so.
+  var restartArmed = false, restartTimer = null;
+  var RESTART_ARMED_MS = 4000;
+
+  function disarmRestart() {
+    restartArmed = false;
+    clearTimeout(restartTimer);
+    $("dorestart").textContent = "Restart";
+  }
+
   $("dorestart").addEventListener("click", function () {
+    if (!restartArmed) {
+      restartArmed = true;
+      this.textContent = "Tap again to confirm";
+      restartTimer = setTimeout(disarmRestart, RESTART_ARMED_MS);
+      return;
+    }
+    disarmRestart();
     this.disabled = true;
     api("/restart", { method: "POST" })
       .catch(function () { return null; })
       .then(function () {
         setNote("Restarting\\u2026 the panel reconnects on its own.", false);
+      });
+  });
+
+  // Plays a real tone through the same broadcaster and WAV server that carry
+  // AirPlay audio, so it answers "is anything coming out?" rather than "does
+  // the speaker answer commands?" - which it does perfectly well while silent.
+  $("settest").addEventListener("click", function () {
+    var btn = this;
+    btn.disabled = true;
+    btn.textContent = "Testing\\u2026";
+    setNote("Playing a test tone\\u2026", false);
+    api("/test-tone", { method: "POST" })
+      .then(function (r) { return r.json().catch(function () { return null; }); })
+      .catch(function () { return null; })
+      .then(function (body) {
+        btn.disabled = false;
+        btn.textContent = "Test speaker";
+        if (!body) return setNote("Could not reach the bridge.", true);
+        // The bridge explains itself; repeating the reasoning here would be a
+        // second copy of it, free to drift.
+        setNote(body.detail || "Test finished.", body.ok === false);
+        poll();
       });
   });
 

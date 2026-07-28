@@ -654,7 +654,8 @@ class TestStatusApiAuth(unittest.TestCase):
 
 
 class TestArtworkAndTransport(unittest.TestCase):
-    """Endpoints added for the web panel's cover art and transport buttons."""
+    """Endpoints added for the web panel: cover art, transport, power and the
+    speaker test."""
 
     def _start(self, token=""):
         port = _free_port()
@@ -777,6 +778,41 @@ class TestArtworkAndTransport(unittest.TestCase):
         _, port = self._start(token="s3cret")
         self.assertEqual(
             self._req(port, "/transport/playpause", "POST")[0], 401)
+
+    # -- test tone ------------------------------------------------------ #
+    def test_test_tone_route_returns_the_verdict(self):
+        """What the tone does is covered above; this pins the wiring, because
+        a path the panel and the server disagree on leaves the button dead
+        with every other test still passing."""
+        import json
+        b, port = self._start()
+        b.play_test_tone = lambda: (True, {
+            "detail": "tone sent to 1 renderer", "renderers": 1,
+            "bytes_sent": 8820, "volume": 7, "muted": False})
+        status, _, body = self._req(port, "/test-tone", method="POST")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["renderers"], 1)
+        self.assertIn("tone sent", payload["detail"])
+
+    def test_refused_test_tone_is_not_reported_as_success(self):
+        import json
+        b, port = self._start()
+        b.play_test_tone = lambda: (False, {
+            "detail": "an AirPlay session is playing - stop it and try again",
+            "renderers": 1, "bytes_sent": 0, "volume": 7, "muted": False})
+        status, _, body = self._req(port, "/test-tone", method="POST")
+        self.assertEqual(status, 503)
+        self.assertFalse(json.loads(body)["ok"])
+
+    def test_test_tone_requires_token_when_set(self):
+        b, port = self._start(token="s3cret")
+        b.play_test_tone = lambda: (True, {
+            "detail": "ok", "renderers": 1, "bytes_sent": 1,
+            "volume": 7, "muted": False})
+        status, _, _ = self._req(port, "/test-tone", method="POST")
+        self.assertEqual(status, 401)
 
     def test_status_reports_transport_availability(self):
         import json as _json
@@ -1187,6 +1223,202 @@ class TestVersionReporting(unittest.TestCase):
         snap = b.snapshot()
         self.assertIn("revision", snap)
         self.assertNotEqual(snap["version"], snap["revision"])
+
+
+class ToneBar(CountingBar):
+    """A renderer that accepts being pointed at the stream."""
+
+    def __init__(self, volume=10, state="STOPPED"):
+        super().__init__(volume)
+        self.state = state
+        self.uris = []
+        self.plays = 0
+
+    def set_uri(self, url, metadata=""):
+        self.uris.append(url)
+
+    def play(self):
+        self.plays += 1
+
+    def transport_state(self, timeout=8):
+        self.calls += 1
+        if self.fail:
+            raise SoundbarError("unreachable")
+        return self.state
+
+    def wam_power(self, on, timeout=6):
+        return "<UIC/>"
+
+    def is_reachable(self, port=None, timeout=3):
+        return True
+
+
+class TestTestTone(unittest.TestCase):
+    """The tone goes down the real audio path, which is the whole point of it
+    - so what needs guarding is everything that path collides with."""
+
+    def _patch(self, name, value):
+        original = getattr(bridge_mod, name)
+        setattr(bridge_mod, name, value)
+        self.addCleanup(setattr, bridge_mod, name, original)
+
+    def _bridge(self, **cfg):
+        # _write_paced runs in real time on purpose; a short tone keeps the
+        # suite quick without changing the path it takes.
+        self._patch("TEST_TONE_SECONDS", 0.05)
+        self._patch("TEST_TONE_CLIENT_WAIT", 0.2)
+        b = Bridge(Config(soundbar_ip="127.0.0.1", **cfg))
+        b.bar = ToneBar()
+        # Never started: the tone needs somewhere to read bytes_streamed from
+        # and a URL to point the renderer at, not a live socket.
+        b.server = bridge_mod.LiveWavServer(b.broadcaster,
+                                            port=b.cfg.stream_port)
+        return b
+
+    # -- guards ------------------------------------------------------------- #
+    def test_refuses_during_an_airplay_session(self):
+        """Both feed the same broadcaster: a tone over live music interleaves
+        into noise, which is indistinguishable from the fault being sought."""
+        b = self._bridge()
+        b.broadcaster.write(b"\x00\x00\x00\x00")     # audio just arrived
+        ok, verdict = b.play_test_tone()
+        self.assertFalse(ok)
+        self.assertIn("AirPlay session", verdict["detail"])
+        self.assertEqual(b.bar.uris, [])             # never touched the speaker
+
+    def test_refuses_while_a_tone_is_already_playing(self):
+        b = self._bridge()
+        b._tone_lock.acquire()
+        self.addCleanup(b._tone_lock.release)
+        ok, verdict = b.play_test_tone()
+        self.assertFalse(ok)
+        self.assertIn("already playing", verdict["detail"])
+
+    def test_refuses_without_a_renderer(self):
+        b = self._bridge()
+        b.bar = None
+        ok, verdict = b.play_test_tone()
+        self.assertFalse(ok)
+        self.assertIn("no renderer", verdict["detail"])
+
+    # -- the happy path ------------------------------------------------------ #
+    def test_audio_reaches_an_attached_renderer(self):
+        b = self._bridge()
+        client = b.broadcaster.add_client()
+        ok, verdict = b.play_test_tone()
+        self.assertTrue(ok)
+        heard = client.read(timeout=0)
+        self.assertGreater(len(heard), 0)
+        self.assertTrue(any(heard), "the renderer was fed pure silence")
+        self.assertEqual(verdict["renderers"], 1)
+
+    def test_engages_only_when_nothing_is_listening(self):
+        """A second SetAVTransportURI restarts the fetch underneath the tone."""
+        b = self._bridge()
+        b.broadcaster.add_client()
+        b.play_test_tone()
+        self.assertEqual(b.bar.uris, [])
+
+    def test_engages_when_no_renderer_is_attached(self):
+        b = self._bridge()
+        b.cfg.advertise_ip = "192.0.2.5"
+        b.play_test_tone()
+        self.assertEqual(len(b.bar.uris), 1)
+        self.assertEqual(b.bar.plays, 1)
+
+    def test_refuses_without_a_running_stream(self):
+        b = self._bridge()
+        b.server = None
+        ok, verdict = b.play_test_tone()
+        self.assertFalse(ok)
+        self.assertIn("stream is not running", verdict["detail"])
+
+    def test_wakes_a_speaker_it_switched_off(self):
+        b = self._bridge()
+        b.powered_off = True
+        b._off_method = "wam"
+        b.broadcaster.add_client()
+        b.play_test_tone()
+        self.assertFalse(b.powered_off)
+
+    # -- the verdict --------------------------------------------------------- #
+    def test_names_a_renderer_that_never_fetched_the_stream(self):
+        """The commonest cause of 'plays but no sound', and invisible without
+        correlating the transport state against the stream."""
+        b = self._bridge()
+        b.cfg.advertise_ip = "192.0.2.5"
+        ok, verdict = b.play_test_tone()
+        self.assertTrue(ok)
+        self.assertIn("no renderer fetched", verdict["detail"])
+        self.assertIn("192.0.2.5", verdict["detail"])
+        self.assertIn(str(b.cfg.stream_port), verdict["detail"])
+
+    def test_names_a_muted_speaker(self):
+        b = self._bridge()
+        b.bar.muted = True
+        b.broadcaster.add_client()
+        ok, verdict = b.play_test_tone()
+        self.assertIn("muted", verdict["detail"])
+        self.assertTrue(verdict["muted"])
+
+    def test_names_a_speaker_turned_all_the_way_down(self):
+        b = self._bridge()
+        b.bar.volume = 0
+        b.broadcaster.add_client()
+        ok, verdict = b.play_test_tone()
+        self.assertIn("volume is 0", verdict["detail"])
+
+    def test_healthy_result_points_at_the_input(self):
+        """Everything measurable is fine, so what is left is the one thing
+        UPnP cannot report."""
+        b = self._bridge()
+        b.broadcaster.add_client()
+        ok, verdict = b.play_test_tone()
+        self.assertTrue(ok)
+        self.assertIn("network input", verdict["detail"])
+
+    # -- honesty in /status --------------------------------------------------- #
+    def test_status_reports_a_tone_rather_than_a_session(self):
+        """A tone moves seconds_since_audio exactly as AirPlay audio does, so
+        without this /status would claim a session that never existed."""
+        b = self._bridge()
+        snap = b.snapshot()
+        self.assertIn("test_tone", snap)
+        self.assertFalse(snap["test_tone"]["playing"])
+
+        b.broadcaster.add_client()
+        b.play_test_tone()
+        after = b.snapshot()
+        self.assertFalse(after["test_tone"]["playing"])   # finished
+        self.assertIn("tone sent", after["test_tone"]["last_result"])
+
+    def test_session_loop_does_not_engage_over_a_running_tone(self):
+        """The tone moves seconds_since_audio exactly as AirPlay audio does, so
+        the loop would otherwise re-engage mid-tone - and a renderer told to
+        fetch the URI again restarts the stream, cutting the tone off."""
+        b = self._bridge()
+        # The loop ticks once a second, so the tone has to span a tick for the
+        # clash to be reachable at all.
+        self._patch("TEST_TONE_SECONDS", 1.2)
+        b.broadcaster.add_client()
+        threading.Thread(target=b._session_loop, daemon=True).start()
+        self.addCleanup(b._stop.set)
+        b.play_test_tone()
+        # Asserted the moment the tone ends: once it has, the guard lifts and
+        # the loop engages as it normally would, on its next tick.
+        self.assertEqual(b.bar.uris, [],
+                         "the session loop re-engaged during the test tone")
+
+    def test_playing_flag_is_set_while_the_tone_runs(self):
+        b = self._bridge()
+        b.broadcaster.add_client()
+        seen = []
+        original = b._write_paced
+        b._write_paced = lambda pcm: (seen.append(b.test_tone_playing),
+                                      original(pcm))
+        b.play_test_tone()
+        self.assertEqual(seen, [True])
+        self.assertFalse(b.test_tone_playing)            # cleared afterwards
 
 
 if __name__ == "__main__":

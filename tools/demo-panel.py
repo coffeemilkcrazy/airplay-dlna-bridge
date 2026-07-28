@@ -117,6 +117,7 @@ class FakeBridge:
                       "off": False,
                       "seconds_until_off": None if PLAYING else 1080.0,
                       "last_result": ""},
+            "test_tone": {"playing": False, "last_result": ""},
             "stream": {"url": "http://192.0.2.5:8770/airplay.wav",
                        "connections": 1, "active": 1, "bytes": 23_068_672},
             "last_error": "",
@@ -127,6 +128,13 @@ class FakeBridge:
 
     def power_off(self, reason: str, manual: bool = False):
         return True, "demo"
+
+    def play_test_tone(self):
+        # No audio in the demo, so it reports the shape of a real verdict
+        # rather than pretending to have played something.
+        return True, {"detail": "demo - no audio was actually played",
+                      "renderers": 1, "bytes_sent": 352800, "seconds": 2.0,
+                      "volume": 7, "muted": False, "state": "PLAYING"}
 
     # The settings form is genuinely driven and genuinely validated - only the
     # writing is left out, so a demo run cannot rewrite a real bridge.env.

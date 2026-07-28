@@ -1,5 +1,6 @@
 """Tests for the live PCM fan-out and WAV streaming server."""
 
+import array
 import socket
 import struct
 import sys
@@ -325,6 +326,75 @@ class TestLiveWavServer(unittest.TestCase):
             got += s.recv(8192)
         s.close()
         self.assertGreater(len(got), 4000)
+
+
+class TestTone(unittest.TestCase):
+    """The test tone is a diagnostic, so it has to be beyond suspicion itself:
+    a tone that clicked, clipped or shifted the interleave would be read as the
+    speaker fault it exists to rule out."""
+
+    def _samples(self, pcm):
+        a = array.array("h")
+        a.frombytes(pcm)
+        return a
+
+    def test_whole_frames_only(self):
+        # A partial frame shifts the stereo interleave for everything after it.
+        b = PcmBroadcaster()
+        self.assertEqual(len(b.tone(0.1)) % b.bytes_per_frame, 0)
+
+    def test_length_matches_the_request(self):
+        b = PcmBroadcaster()
+        self.assertEqual(len(b.tone(0.5)), int(b.bytes_per_second * 0.5))
+
+    def test_channels_carry_the_same_signal(self):
+        a = self._samples(PcmBroadcaster().tone(0.1))
+        self.assertEqual(list(a[0::2]), list(a[1::2]))
+
+    def test_amplitude_is_respected(self):
+        a = self._samples(PcmBroadcaster().tone(0.2, amplitude=0.25))
+        self.assertLessEqual(max(abs(s) for s in a), int(0.25 * 32767))
+
+    def test_reaches_full_amplitude_between_the_fades(self):
+        """A fade that swallowed the whole tone would be inaudible."""
+        a = self._samples(PcmBroadcaster().tone(0.2, amplitude=0.25))
+        self.assertGreater(max(abs(s) for s in a), int(0.25 * 32767) * 0.9)
+
+    def test_starts_and_ends_near_silence(self):
+        """The click this avoids is exactly what someone testing a silent
+        speaker would hear and mistake for success."""
+        a = self._samples(PcmBroadcaster().tone(0.2, amplitude=0.5))
+        self.assertLess(abs(a[0]), 200)
+        self.assertLess(abs(a[-1]), 200)
+
+    def test_short_tone_still_fades_both_ends(self):
+        """Fades must halve rather than overlap, or a brief tone never rises."""
+        a = self._samples(PcmBroadcaster().tone(0.01, amplitude=0.5))
+        self.assertGreater(len(a), 0)
+        self.assertLess(abs(a[0]), 200)
+        self.assertLess(abs(a[-1]), 200)
+
+    def test_is_coherent_audio_not_noise(self):
+        """The same correlation check the bridge uses on shairport's output."""
+        a = self._samples(PcmBroadcaster().tone(0.5))[0::2]
+        mean = sum(a) / len(a)
+        num = sq = 0.0
+        prev = a[0] - mean
+        for i in range(1, len(a)):
+            cur = a[i] - mean
+            num += prev * cur
+            sq += cur * cur
+            prev = cur
+        self.assertGreater(num / sq, 0.9)
+
+    def test_zero_length_is_empty(self):
+        self.assertEqual(PcmBroadcaster().tone(0), b"")
+
+    def test_refuses_a_width_it_cannot_generate(self):
+        """The WAV header, bridge.py and shairport's stanza all say S16_LE;
+        silently emitting something else is how this project gets bitten."""
+        with self.assertRaises(ValueError):
+            PcmBroadcaster(bits=32).tone(0.1)
 
 
 if __name__ == "__main__":

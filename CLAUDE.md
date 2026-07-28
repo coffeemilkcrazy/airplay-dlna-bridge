@@ -136,6 +136,20 @@ The policy in `AutoOffPolicy` never fires before the process has held a session
 speaker someone is watching TV through after every restart) and allows one
 attempt per idle period.
 
+**The test tone must travel the real path, or it proves nothing.**
+`play_test_tone` feeds `PcmBroadcaster` and is paced in real time by
+`_write_paced`, exactly as `_pump` feeds live audio — a renderer accepts
+`SetAVTransportURI`, answers `Play` and reports `PLAYING` while emitting
+nothing, so only audio that has actually been through the broadcaster and WAV
+server is evidence. Writing it in one go would also overshoot `_Client`'s
+two-second backlog (which a two-second tone reaches exactly) and be trimmed
+away. It refuses during a session because both feed the same broadcaster and
+would interleave into noise; it waits for a client to attach, because a tone
+played before the renderer fetches lands nowhere. The tone moves
+`seconds_since_audio` exactly as AirPlay audio does, so `session_active` goes
+true for one — `test_tone.playing` is what stops `/status` claiming a session
+that never existed.
+
 **Auto-off checks the speaker's input, not just its transport state.**
 `Bridge._renderer_in_use()` asks AVTransport *and* WAM `GetFunc`, because a
 soundbar playing a film through HDMI-ARC reports exactly what an idle one does

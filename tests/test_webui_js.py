@@ -160,6 +160,34 @@ class TestPanelBehaviour(unittest.TestCase):
         self.assertBehaviour("restart not requested until asked")
         self.assertBehaviour("restart requested on demand")
 
+    def test_restart_takes_two_taps(self):
+        """The button is always available now, so a stray tap must not drop a
+        live AirPlay session on an unauthenticated LAN panel."""
+        self.assertBehaviour("first tap arms rather than restarting")
+        self.assertBehaviour("armed restart says a second tap is needed")
+        self.assertBehaviour("restart button returns to its resting label")
+
+    # -- test speaker --------------------------------------------------------- #
+    def test_speaker_test_posts_and_reports_the_verdict(self):
+        """The bridge decides what the tone proved; the panel must relay that
+        rather than carry a second copy of the reasoning."""
+        self.assertBehaviour("test tone POSTed")
+        self.assertBehaviour("verdict reported from the bridge")
+
+    def test_speaker_test_button_reflects_progress(self):
+        self.assertBehaviour("test speaker disabled while the tone plays")
+        self.assertBehaviour("test speaker says it is running")
+        self.assertBehaviour("test speaker re-enabled afterwards")
+        self.assertBehaviour("test speaker returns to its resting label")
+
+    def test_refused_speaker_test_reads_as_a_fault(self):
+        self.assertBehaviour("refused test explains why")
+        self.assertBehaviour("refused test marked as a fault")
+
+    def test_tone_is_not_reported_as_an_airplay_session(self):
+        """A tone moves seconds_since_audio exactly as AirPlay audio does."""
+        self.assertBehaviour("test tone named, not reported as a session")
+
     def test_read_only_host_is_stated_before_the_form_is_filled_in(self):
         """Under systemd the unit mounts /etc read-only, so without the
         ReadWritePaths exception every save fails at the last step."""
